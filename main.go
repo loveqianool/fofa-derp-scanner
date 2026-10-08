@@ -1,0 +1,155 @@
+// derp-scan: 从 FOFA 导出的 DERP 节点资产中，一条命令探测并输出可用的 derpMap。
+//
+// 流程: 解析 FOFA JSON -> 并发 DERP 协议探测 -> 筛选稳定低延迟节点 ->
+// 按延迟排序、重新编号 -> 输出可直接粘贴到 Tailscale ACL derpMap 的 JSON。
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"os"
+	"os/signal"
+	"sort"
+	"sync"
+	"syscall"
+	"time"
+)
+
+func main() {
+	os.Exit(run())
+}
+
+func run() int {
+	var (
+		input       = flag.String("input", "", "FOFA 导出的 JSON 文件路径（必填）")
+		output      = flag.String("output", "derp.json", "输出 derpMap JSON 路径")
+		start       = flag.Int("start", 1000, "RegionID 起始编号")
+		limit       = flag.Int("limit", 50, "最多输出的节点数（按延迟取最低的 N 个），0 表示不限制")
+		maxLatency  = flag.Duration("max-latency", 100*time.Millisecond, "保留节点的中位延迟上限")
+		samples     = flag.Int("samples", 3, "每个节点 ping 采样次数（全部成功才保留）")
+		concurrency = flag.Int("concurrency", 50, "并发探测数")
+		timeout     = flag.Duration("timeout", 20*time.Second, "单个节点探测总超时")
+		pingTimeout = flag.Duration("ping-timeout", 5*time.Second, "单次 ping 超时")
+	)
+	flag.Parse()
+
+	if *input == "" {
+		fmt.Fprintln(os.Stderr, "错误: 必须指定 --input")
+		flag.Usage()
+		return 2
+	}
+
+	data, err := os.ReadFile(*input)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "读取输入文件失败: %v\n", err)
+		return 1
+	}
+	assets, err := ParseAssets(data)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "解析 FOFA 数据失败: %v\n", err)
+		return 1
+	}
+	if len(assets) == 0 {
+		fmt.Fprintln(os.Stderr, "没有解析到有效节点（需要 ip + port）")
+		return 1
+	}
+	fmt.Printf("解析到 %d 个候选节点，开始探测（并发 %d，每节点 %d 次 ping）…\n",
+		len(assets), *concurrency, *samples)
+
+	cands := BuildCandidates(assets, *start)
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	sem := make(chan struct{}, *concurrency)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	ok := make([]Candidate, 0, len(cands))
+	done := 0
+
+	for _, c := range cands {
+		c := c
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-sem }()
+
+			pctx, cancel := context.WithTimeout(ctx, *timeout)
+			defer cancel()
+
+			host := c.Asset.IP
+			if c.Asset.Domain != "" {
+				host = c.Asset.Domain
+			}
+			rtt, err := ProbeDERP(pctx, host, c.Asset.Port, *samples, *pingTimeout)
+
+			mu.Lock()
+			defer mu.Unlock()
+			done++
+			label := fmt.Sprintf("%s:%d", host, c.Asset.Port)
+			switch {
+			case err != nil:
+				fmt.Printf("[%d/%d] %-30s 失败: %v\n", done, len(cands), label, shortErr(err))
+			case rtt > *maxLatency:
+				fmt.Printf("[%d/%d] %-30s %v 太慢（上限 %v），丢弃\n", done, len(cands), label, rtt.Round(time.Millisecond), *maxLatency)
+			default:
+				c.RTT = rtt
+				ok = append(ok, c)
+				fmt.Printf("[%d/%d] %-30s 可用 %v\n", done, len(cands), label, rtt.Round(time.Millisecond))
+			}
+		}()
+	}
+	wg.Wait()
+
+	if ctx.Err() != nil {
+		fmt.Fprintln(os.Stderr, "\n已取消，未写入输出文件。")
+		return 1
+	}
+
+	if len(ok) == 0 {
+		fmt.Fprintln(os.Stderr, "没有可用节点，未生成输出文件。")
+		return 1
+	}
+
+	// 按延迟取最低的 limit 个
+	if *limit > 0 && len(ok) > *limit {
+		sort.Slice(ok, func(i, j int) bool { return ok[i].RTT < ok[j].RTT })
+		fmt.Printf("可用节点 %d 个，按 --limit 取延迟最低的 %d 个。\n", len(ok), *limit)
+		ok = ok[:*limit]
+	}
+
+	m := BuildDERPMap(ok, *start)
+	out, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "生成 JSON 失败: %v\n", err)
+		return 1
+	}
+	out = append(out, '\n')
+	if err := os.WriteFile(*output, out, 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "写入输出文件失败: %v\n", err)
+		return 1
+	}
+
+	fmt.Printf("\n完成：%d/%d 个节点可用（中位延迟 ≤ %v），已按延迟排序并从 %d 重新编号，写入 %s\n",
+		len(ok), len(cands), *maxLatency, *start, *output)
+	fmt.Println("下一步：把该文件中 Regions 下的内容粘贴到 Tailscale ACL 的 derpMap.Regions 里。")
+	return 0
+}
+
+// shortErr 把多层 wrapped error 压成最后一句，日志更干净。
+func shortErr(err error) string {
+	msg := err.Error()
+	for i := len(msg) - 1; i >= 0; i-- {
+		if msg[i] == ':' && i+2 < len(msg) {
+			return msg[i+2:]
+		}
+	}
+	return msg
+}
