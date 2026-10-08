@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strconv"
 	"testing"
 	"time"
@@ -132,5 +133,53 @@ func TestProbeDERPConnRefused(t *testing.T) {
 	defer cancel()
 	if _, err := ProbeDERP(ctx, "127.0.0.1", 1, 1, 2*time.Second); err == nil {
 		t.Fatal("期望连接被拒绝，但成功了")
+	}
+}
+
+// TestProxyFromHTTPOnly 验证：只设置 HTTP_PROXY（不设 HTTPS_PROXY）时，
+// 探测目标为 https 也能拿到代理地址（Go 标准库不会这样回落，curl 会）。
+func TestProxyFromHTTPOnly(t *testing.T) {
+	t.Setenv("HTTPS_PROXY", "")
+	t.Setenv("https_proxy", "")
+	t.Setenv("HTTP_PROXY", "proxy:8080") // 无 scheme 也要能解析
+	t.Setenv("http_proxy", "")
+
+	pu := proxyFromHTTPOnly()
+	if pu == nil || pu.Host != "proxy:8080" {
+		t.Fatalf("期望解析出代理 proxy:8080，实际 %v", pu)
+	}
+
+	t.Setenv("HTTP_PROXY", "")
+	if proxyFromHTTPOnly() != nil {
+		t.Fatal("无代理变量时应返回 nil")
+	}
+
+	t.Setenv("http_proxy", "http://proxy2:9090")
+	pu = proxyFromHTTPOnly()
+	if pu == nil || pu.Host != "proxy2:9090" {
+		t.Fatalf("期望解析出代理 proxy2:9090，实际 %v", pu)
+	}
+}
+
+// TestWriteFileAtomic 验证原子写入：内容完整，且不会留下临时文件。
+func TestWriteFileAtomic(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/derp.json"
+	data := []byte(`{"Regions":{}}` + "\n")
+	if err := writeFileAtomic(path, data); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(data) {
+		t.Fatalf("内容不一致: %q", got)
+	}
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if e.Name() != "derp.json" {
+			t.Fatalf("残留临时文件: %s", e.Name())
+		}
 	}
 }
