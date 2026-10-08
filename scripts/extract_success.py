@@ -59,7 +59,7 @@ def process(html_file, json_file, output_file, start_region):
         if len(tds) < 7:
             continue
 
-        if not re.search(r'\bclass=derp_mesh\b', tds[1]) or tds[5].split()[0] != 'succeeded':
+        if not re.search(r'\bclass=(derp_udp|tls)\b', tds[1]) or tds[5].split()[0] != 'succeeded':
             continue
 
         results_match = re.search(r'Recent: \[([^]]*)\]', tds[5])
