@@ -1,0 +1,6 @@
+.git
+dist/
+derp.json
+fofa*.json
+*sample*.json
+*.log
