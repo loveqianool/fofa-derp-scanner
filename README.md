@@ -55,6 +55,7 @@ Usage of derp-scan:
   -timeout duration    单节点探测总超时（默认 20s）
   -ping-timeout duration
                        单次 ping 超时（默认 5s）
+  -version             打印版本并退出
 ```
 
 示例：
