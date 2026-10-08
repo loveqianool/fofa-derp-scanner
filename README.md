@@ -1,112 +1,153 @@
-# FOFA DERP Scanner
+# derp-scan
 
-一个用于自动化扫描 FOFA 上的 Tailscale DERP 节点，进行可用性测试，并生成可以在 Tailscale 后台中直接使用的自定义 `derpMap` 节点的工具流。
+从 FOFA 导出的 DERP 节点资产中，一条命令探测并输出**真正可用**的 Tailscale `derpMap`。
 
-**当前版本：v1.0.0**
+这是 [v1 Python 版](#与-v1-的区别)的 Go 重写版：单文件、无依赖（除 Tailscale 官方 DERP 协议库），把原来"导 JSON → 转格式 → Docker 探测 → 手动存 HTML → 提取"的 5 步手工流程收进一个二进制，一次跑完。
 
-## 整体流程概述
+[![Docker](https://github.com/loveqianool/fofa-derp-scanner/actions/workflows/docker.yml/badge.svg)](https://github.com/loveqianool/fofa-derp-scanner/actions/workflows/docker.yml)
 
-这个项目的目标是从海量的公开 DERP 节点中，筛选出可以在国内或特定网络环境下正常连接和中继的优质节点。主要步骤如下：
+## 特性
 
-1. **信息收集（FOFA）**：从 FOFA 获取符合条件的 DERP 节点 IP 及端口信息。
-2. **格式转换**：将 FOFA 导出的 JSON 资产转换成 DERP Prober 需要的标准 `derp.json` 格式。
-3. **探测存活**：使用 docker 容器 `tailscale-derpprober` 对节点进行大批量并发探测。
-4. **结果提取**：提取稳定、低延迟的 mesh 节点，按延迟排序并连续重新编号。
-5. **合入应用**：将生成的结果复制到 Tailscale 管理后台，供设备使用。
+- **真 DERP 协议探测**：TCP 建连 → TLS 握手 → HTTP Upgrade → DERP 握手 → 多次 ping 取中位 RTT，只有完整走通 DERP 协议的节点才会被保留（旧版只测 TLS 握手，会把大量"握手通但不中继"的节点误判为可用）
+- **一次跑完**：输入 FOFA 导出的 JSON，直接输出可粘贴进 Tailscale ACL 的 `derp.json`
+- **并发探测**：默认 50 并发，2600+ 节点几分钟扫完
+- **多格式兼容**：FOFA 网页导出的 JSON 数组 / JSON Lines / `{"results":[...]}` 包裹格式都能解析，按 `ip:port` 自动去重
+- **代理支持**：识别 `HTTPS_PROXY`/`HTTP_PROXY`（含 `NO_PROXY`），自动走 HTTP CONNECT 隧道
+- **80 端口降级**：端口实际是明文 HTTP 时自动降级为明文 Upgrade 探测
 
-## 第一步：信息收集 (FOFA)
+## 快速开始
 
-1. 打开 [FOFA 官网](https://fofa.info/)
-2. 使用以下查询条件进行搜索（可以根据需要调整 `country`）：
-   ```fofa
-   body="Tailscale" && body="DERP server" && country="CN"
-   ```
-3. 在页面上方点击**导出**，选择 **JSON** 格式。假设保存为 `fofa_assets.json`。
-
-## 第二步：格式转换
-
-将上一步下载的 FOFA 数据转换为 `derp.json` 文件：
+### 用 Docker（推荐）
 
 ```bash
-# 进入项目目录
-cd fofa-derp-scanner
-
-# 运行转换脚本 (请确保已经安装 Python3)
-python3 scripts/convert_assets.py --input /path/to/fofa_assets.json --output config/derp.json --start 900
-```
-*(这会将每个节点的 RegionID 从 900 开始自动递增分配)*
-
-## 第三步：探测节点存活 (DERP Prober)
-
-本项目包含一个 `docker-compose.yml` 文件。在这个文件中，我们将本地的 `config` 文件夹挂载到了容器内部：
-
-### 1. 调整 Docker 路径配置
-打开项目根目录下的 `docker-compose.yml`，查看 `volumes` 部分：
-```yaml
-    volumes:
-      # ./config 代表当前目录下的 config 文件夹，你可以修改为你的绝对路径
-      - ./config:/config
-```
-如果你在第二步中把 `derp.json` 生成到了当前项目的 `config` 目录下，那么这里**不需要**修改任何路径。
-
-### 2. 启动探测容器
-```bash
-docker-compose up -d
+# 1. 在 FOFA 按 body="Tailscale" && body="DERP server" 搜索，导出 JSON，假设为 fofa.json
+# 2. 一条命令跑完（把当前目录挂载进去读写文件）
+docker run --rm -v $(pwd):/data ghcr.io/loveqianool/fofa-derp-scanner:latest \
+  --input /data/fofa.json --output /data/derp.json
 ```
 
-### 3. 获取成功探测报告
-1. 在浏览器中打开 [http://localhost:8030/](http://localhost:8030/)
-2. 点击进入 `success` 页面（这里列出了所有成功连接的节点）。**注意：探测需要时间，请耐心等待几分钟直至列表稳定。**
-3. 使用浏览器的插件（例如：[SingleFile](https://chrome.google.com/webstore/detail/singlefile/mpiodijhokgodhhofbcjdecpffjipkle)）将**整个 success 页面保存为一个 HTML 文件**。假设保存为 `success_report.html`。
+### 用二进制
 
-## 第四步：提取最终成功节点
-
-现在我们需要把那个庞大繁杂的 HTML 报告，转换回精简的 JSON：
+到 [Releases](https://github.com/loveqianool/fofa-derp-scanner/releases) 或用 Docker 镜像里的二进制：
 
 ```bash
-python3 scripts/extract_success.py \
-  --html /path/to/success_report.html \
-  --json config/derp.json \
-  --output config/derp-success-prober.json \
-  --start 900
+./derp-scan --input fofa.json --output derp.json
 ```
-*(仅保留当前及近期探测全部成功、最新延迟和近期中位延迟均小于 100 ms 的 mesh 节点。结果按最新延迟升序排列，并从 `--start` 开始连续重新编号。)*
 
-运行完毕后，最终筛选出的高质量节点配置就躺在 `config/derp-success-prober.json` 里了！
+### 接入 Tailscale
 
-## 第五步：合入 Tailscale 后台
+1. 打开 [Tailscale ACL](https://login.tailscale.com/admin/acls/file)
+2. 把 `derp.json` 中 `Regions` 下的内容粘贴进 `derpMap.Regions`
+3. 保存。客户端会自动选用延迟最低的可用节点，可用 `tailscale status` 查看当前连的是哪个节点。
 
-1. 打开 [Tailscale Access Controls (ACLs)](https://login.tailscale.com/admin/acls/file) 页面。
-2. 打开刚才生成的 `config/derp-success-prober.json` 文件。
-3. 在你的 ACL JSON 根节点中，找到（或添加）`"derpMap"` 字段：
+## 用法
 
-```json
-{
-    // ... 其他 ACL 配置 ...
-
-    "derpMap": {
-        "OmitDefaultRegions": false, // 注意：改为true
-        "Regions": {
-            // ---> 将 derp-success-prober.json 中的 "Regions" 里面的内容，原样复制粘贴到这里 <---
-        }
-    }
-}
 ```
-4. 点击 **Save** 保存。
+Usage of derp-scan:
+  -input string        FOFA 导出的 JSON 文件路径（必填）
+  -output string       输出 derpMap JSON 路径（默认 "derp.json"）
+  -start int           RegionID 起始编号（默认 1000）
+  -limit int           最多输出的节点数，按延迟取最低的 N 个（默认 50，0 为不限制）
+  -max-latency duration
+                       保留节点的中位延迟上限（默认 100ms）
+  -samples int         每节点 ping 采样次数，全部成功才保留（默认 3）
+  -concurrency int     并发探测数（默认 50）
+  -timeout duration    单节点探测总超时（默认 20s）
+  -ping-timeout duration
+                       单次 ping 超时（默认 5s）
+```
 
-## 常见问题与维护
+示例：
 
-如果你在使用过程中发现网络卡顿，中继 (relay) 无法连通：
+```bash
+# 取延迟最低的 100 个，延迟上限放宽到 200ms
+./derp-scan --input fofa.json --output derp.json --limit 100 --max-latency 200ms
 
-1. **排查节点**：在设备终端执行 `tailscale status`
-2. 或者在 Windows PowerShell 中执行：
-   ```powershell
-   (Get-NetTCPConnection -OwningProcess (Get-Process tailscaled | Select-Object -Last 1).Id -State Established).RemoteAddress
-   ```
-   查看当前正在连接的是哪个 IP 的节点。
-3. **剔除节点**：去 Tailscale ACLs 后台，在 `derpMap.Regions` 下找到对应 IP 的节点块，将其删除，然后 `Ctrl+S` 保存即可。Tailscale 客户端会自动刷新并连接下一个可用节点。
+# 全部可用节点都要
+./derp-scan --input fofa.json --output derp.json --limit 0
+```
+
+输出示例：
+
+```
+解析到 2634 个候选节点，开始探测（并发 50，每节点 3 次 ping）…
+[1/2634] 1.2.3.4:443                   可用 38ms
+[2/2634] 5.6.7.8:8443                  失败: connection refused
+...
+可用节点 412 个，按 --limit 取延迟最低的 50 个。
+
+完成：50/2634 个节点可用（中位延迟 ≤ 100ms），已按延迟排序并从 1000 重新编号，写入 derp.json
+```
+
+## Docker 镜像
+
+每次 push 到 `main` 分支都会自动构建并推送到 GHCR，提供 amd64/arm64 × gnu/musl 四种镜像：
+
+| Tag | 说明 |
+|-----|------|
+| `latest` | Debian(gnu) 基，amd64 + arm64 多架构 |
+| `musl` | Alpine(musl) 基，amd64 + arm64 多架构 |
+| `gnu-amd64` / `gnu-arm64` | Debian 基，单架构 |
+| `musl-amd64` / `musl-arm64` | Alpine 基，单架构 |
+
+```bash
+# Alpine(musl) 版，镜像更小
+docker run --rm -v $(pwd):/data ghcr.io/loveqianool/fofa-derp-scanner:musl \
+  --input /data/fofa.json --output /data/derp.json
+```
+
+> 二进制是纯静态编译的，不依赖目标系统的 libc，gnu/musl 只是基础镜像的区别。
+> 首次推送后如果拉取时提示无权限，到 [Packages](https://github.com/loveqianool?tab=packages) 把该包的可见性改为 Public。
+
+## 工作原理
+
+```
+FOFA JSON → 解析去重 → 并发探测 → 筛选 → 排序编号 → derp.json
+```
+
+探测（每个节点）：
+
+1. TCP 建连（支持经 `HTTPS_PROXY` 的 CONNECT 隧道）
+2. TLS 握手（跳过证书校验，自签证书也能测；ClientHello 带 `http/1.1` ALPN）
+3. `GET /derp` + `Upgrade: DERP`，要求 `101 Switching Protocols`
+4. DERP 握手（服务端 ServerKey → 客户端 ClientInfo，nacl 加密，声明为 prober）
+5. 发送 N 次 ping，取中位 RTT；任一次失败则丢弃该节点
+
+保留条件：全部 ping 成功 **且** 中位延迟 ≤ `--max-latency`。结果按延迟升序、从 `--start` 连续编号，节点带 `InsecureForTests: true`（跳过证书校验，Tailscale 客户端直连即用）。
+
+## 与 v1 的区别
+
+|  | v1 (Python) | v2 (Go, 本版) |
+|---|---|---|
+| 探测方式 | Docker 跑 derpprober，只测 TLS 握手/UDP | 内置真 DERP 协议 ping |
+| 流程 | 5 步手工操作 | 一条命令 |
+| 依赖 | Python + Docker + 浏览器插件 | 零依赖单文件 |
+| 误判 | 握手通但不中继的节点会被收录 | 只有真能中继的才收录 |
+
+## 本地构建
+
+```bash
+go build -o derp-scan .
+go test ./...   # 含自建假 DERP 服务器的端到端探测测试
+```
+
+```bash
+# 本地构建 Docker 镜像（gnu / musl 二选一）
+docker build --build-arg BASE_IMAGE=debian:bookworm-slim -t derp-scan .
+docker build --build-arg BASE_IMAGE=alpine:3.21 -t derp-scan:musl .
+```
+
+## FAQ
+
+**Q: 输出的节点用旧版 Docker derpprober 验证，很多显示失败？**
+A: 两个工具标准不同。derpprober 的 tls 探测会校验证书（自签证书直接判失败），而本工具输出的节点都带 `InsecureForTests: true`，Tailscale 客户端会跳过证书校验。以本工具的真 ping 结果和 `tailscale status` 的实际连接为准。
+
+**Q: 扫出来可用节点太少？**
+A: 放宽 `--max-latency`（如 `200ms`）或 `--limit 0` 输出全部可用节点。
+
+**Q: 需要走代理？**
+A: 设置 `HTTPS_PROXY` 环境变量即可，`NO_PROXY` 也会被遵守。
 
 ---
 
-> 开源协议：MIT
-> 感谢 [helloworlde/tailscale-derpprober](https://github.com/helloworlde/tailscale-derpprober) 及linuxdo的各位佬提供的优秀探测镜像支持！
+MIT License
