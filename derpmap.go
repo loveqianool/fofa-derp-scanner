@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"sort"
 	"time"
 )
@@ -25,7 +26,9 @@ type Node struct {
 	RegionID         int    `json:"RegionID"`
 	HostName         string `json:"HostName,omitempty"`
 	IPv4             string `json:"IPv4,omitempty"`
+	IPv6             string `json:"IPv6,omitempty"`
 	DERPPort         int    `json:"DERPPort"`
+	STUNPort         int    `json:"STUNPort,omitempty"`
 	InsecureForTests bool   `json:"InsecureForTests"`
 }
 
@@ -41,20 +44,26 @@ func BuildCandidates(assets []Asset, start int) []Candidate {
 	cands := make([]Candidate, 0, len(assets))
 	for i, a := range assets {
 		rid := start + i
-		name := a.Domain
-		if name == "" {
-			name = a.IP
-		}
+		name := displayName(a)
 		node := Node{
-			Name:             fmt.Sprintf("%d-%s", rid, name),
-			RegionID:         rid,
+			Name: fmt.Sprintf("%d-%s", rid, name),
+			RegionID: rid,
+			// HostName 必须始终有值：derphttp 走代理拨号时会拒绝空 HostName。
+			// 无域名时填 IP 字面量，直连拨号仍走下面的 IPv4/IPv6（强制 IP，不走 DNS）。
+			HostName:         name,
 			DERPPort:         a.Port,
+			STUNPort:         -1, // 只验证了 TCP DERP，禁用未经验证的 UDP STUN（0 会被当作 3478）
 			InsecureForTests: true,
 		}
-		if a.Domain != "" {
-			node.HostName = a.Domain
-		} else {
-			node.IPv4 = a.IP
+		if a.Domain == "" {
+			// 无域名：按地址类型填入对应字段，避免 IPv6 被误塞进 IPv4 导致客户端忽略
+			if ip := net.ParseIP(a.IP); ip != nil {
+				if ip.To4() != nil {
+					node.IPv4 = a.IP
+				} else {
+					node.IPv6 = a.IP
+				}
+			}
 		}
 		cands = append(cands, Candidate{
 			Asset: a,
