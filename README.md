@@ -101,7 +101,7 @@ docker run --rm -v $(pwd):/data ghcr.io/loveqianool/fofa-derp-scanner:latest \
 
 ## 发版
 
-打 tag 即自动编译 5 平台（linux amd64/arm64、windows amd64、darwin amd64/arm64）静态二进制并挂到 GitHub Release：
+打 tag 即自动编译 4 平台（linux amd64/arm64、windows amd64、android arm64）静态二进制并挂到 GitHub Release：
 
 ```bash
 git tag v2.0.0 && git push origin v2.0.0
