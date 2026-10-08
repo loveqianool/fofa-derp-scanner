@@ -57,6 +57,7 @@ Usage of derp-scan:
   -ping-timeout duration
                        单次 ping 超时（默认 5s）
   -relay-test          额外验证客户端间中继转发（建两个客户端，A 发包 B 收），更严格（默认 false）
+  -region string       只保留指定区域的节点（按 FOFA 城市名过滤，逗号分隔多个，不区分大小写），如 "Hong Kong"
   -version             打印版本并退出
 ```
 
@@ -66,8 +67,11 @@ Usage of derp-scan:
 # 取延迟最低的 100 个，延迟上限放宽到 200ms
 ./derp-scan --input fofa.json --output derp.json --limit 100 --max-latency 200ms
 
-# 全部可用节点都要
-./derp-scan --input fofa.json --output derp.json --limit 0
+# 只要香港的 20 个最低延迟节点
+./derp-scan --input fofa.json --output derp.json --region "Hong Kong" --limit 20
+
+# 多个区域逗号分隔（大小写/空格不敏感）
+./derp-scan --input fofa.json --output derp.json --region "hongkong,singapore" --limit 20
 ```
 
 输出示例：

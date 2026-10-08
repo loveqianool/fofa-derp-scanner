@@ -42,6 +42,7 @@ func run() int {
 		timeout     = flag.Duration("timeout", 20*time.Second, "单个节点探测总超时")
 		pingTimeout = flag.Duration("ping-timeout", 5*time.Second, "单次 ping 超时")
 		relayTest   = flag.Bool("relay-test", false, "额外验证客户端间中继转发（建两个客户端，A 发包 B 收），更严格")
+		region      = flag.String("region", "", "只保留指定区域的节点（按 FOFA 城市名过滤，逗号分隔多个，不区分大小写），如 \"Hong Kong\"")
 		showVersion = flag.Bool("version", false, "打印版本并退出")
 	)
 	flag.Parse()
@@ -99,6 +100,20 @@ func run() int {
 	if len(assets) == 0 {
 		fmt.Fprintln(os.Stderr, "没有解析到有效节点（需要 ip + port）")
 		return 1
+	}
+
+	// 按区域过滤（探测前过滤，省时间）
+	if strings.TrimSpace(*region) != "" {
+		filtered := filterByRegion(assets, *region)
+		if len(filtered) == 0 {
+			fmt.Fprintf(os.Stderr, "区域 %q 没有匹配到节点。文件中实际的区域分布：\n", *region)
+			for _, rs := range listRegions(assets) {
+				fmt.Fprintf(os.Stderr, "  %s: %d 个\n", rs.City, rs.Count)
+			}
+			return 1
+		}
+		fmt.Printf("按区域过滤 %q：%d → %d 个候选节点\n", *region, len(assets), len(filtered))
+		assets = filtered
 	}
 	relayMsg := ""
 	if *relayTest {
