@@ -81,23 +81,28 @@ Usage of derp-scan:
 
 ## Docker 镜像
 
-每次 push 到 `main` 分支都会自动构建并推送到 GHCR，提供 amd64/arm64 × gnu/musl 四种镜像：
+每次 push 到 `main` 分支都会自动构建并推送到 GHCR，Alpine (musl) 基础镜像，提供 amd64/arm64 多架构：
 
 | Tag | 说明 |
 |-----|------|
-| `latest` | Debian(gnu) 基，amd64 + arm64 多架构 |
-| `musl` | Alpine(musl) 基，amd64 + arm64 多架构 |
-| `gnu-amd64` / `gnu-arm64` | Debian 基，单架构 |
-| `musl-amd64` / `musl-arm64` | Alpine 基，单架构 |
+| `latest` | amd64 + arm64 多架构 |
+| `amd64` / `arm64` | 单架构 |
 
 ```bash
-# Alpine(musl) 版，镜像更小
-docker run --rm -v $(pwd):/data ghcr.io/loveqianool/fofa-derp-scanner:musl \
+docker run --rm -v $(pwd):/data ghcr.io/loveqianool/fofa-derp-scanner:latest \
   --input /data/fofa.json --output /data/derp.json
 ```
 
-> 二进制是纯静态编译的，不依赖目标系统的 libc，gnu/musl 只是基础镜像的区别。
+> 二进制是纯静态编译的，不依赖目标系统的 libc，在 glibc / musl 系统上都能跑。
 > 首次推送后如果拉取时提示无权限，到 [Packages](https://github.com/loveqianool?tab=packages) 把该包的可见性改为 Public。
+
+## 发版
+
+打 tag 即自动编译 5 平台（linux amd64/arm64、windows amd64、darwin amd64/arm64）静态二进制并挂到 GitHub Release：
+
+```bash
+git tag v2.0.0 && git push origin v2.0.0
+```
 
 ## 工作原理
 
@@ -132,9 +137,8 @@ go test ./...   # 含自建假 DERP 服务器的端到端探测测试
 ```
 
 ```bash
-# 本地构建 Docker 镜像（gnu / musl 二选一）
-docker build --build-arg BASE_IMAGE=debian:bookworm-slim -t derp-scan .
-docker build --build-arg BASE_IMAGE=alpine:3.21 -t derp-scan:musl .
+# 本地构建 Docker 镜像（多架构）
+docker buildx build --platform linux/amd64,linux/arm64 -t derp-scan .
 ```
 
 ## FAQ
