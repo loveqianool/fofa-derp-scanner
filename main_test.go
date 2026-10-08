@@ -60,3 +60,22 @@ func TestDedupArgv(t *testing.T) {
 		t.Fatalf("got %q", got)
 	}
 }
+
+// TestMaxOutput 验证 900-999 范围上限与 --limit 的取小逻辑。
+func TestMaxOutput(t *testing.T) {
+	cases := []struct{ start, limit, avail, want int }{
+		{900, 50, 929, 50},   // limit 最小
+		{900, 0, 929, 100},   // 不限量时被 900-999 卡到 100
+		{900, 0, 30, 30},     // 可用数不足
+		{950, 0, 200, 50},    // start=950 时只剩 50 个 ID
+		{999, 0, 200, 1},     // 只剩 1 个 ID
+		{900, 200, 500, 100}, // limit 超过范围上限仍被卡到 100
+		{900, 100, 500, 100}, // limit 恰好等于上限
+	}
+	for _, c := range cases {
+		if got := maxOutput(c.start, c.limit, c.avail); got != c.want {
+			t.Errorf("maxOutput(%d,%d,%d)=%d, want %d",
+				c.start, c.limit, c.avail, got, c.want)
+		}
+	}
+}

@@ -16,7 +16,7 @@ func TestBuildCandidatesNodeFields(t *testing.T) {
 		{IP: "2.2.2.2", Port: 8443, Domain: "a.com"},
 		{IP: "2001:db8::1", Port: 443},
 	}
-	cands := BuildCandidates(assets, 1000)
+	cands := BuildCandidates(assets, 900)
 	if len(cands) != 3 {
 		t.Fatalf("候选数量错误: %d", len(cands))
 	}
@@ -56,9 +56,9 @@ func TestBuildCandidatesNodeFields(t *testing.T) {
 // （STUNPort: -1 不能被 omitempty 吃掉，HostName 不能缺席）。
 func TestDERPMapJSONFields(t *testing.T) {
 	assets := []Asset{{IP: "1.1.1.1", Port: 443}}
-	cands := BuildCandidates(assets, 1000)
+	cands := BuildCandidates(assets, 900)
 	cands[0].RTT = 10_000_000
-	m := BuildDERPMap(cands, 1000)
+	m := BuildDERPMap(cands, 900)
 	out, err := json.Marshal(m)
 	if err != nil {
 		t.Fatal(err)

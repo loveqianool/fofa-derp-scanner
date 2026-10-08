@@ -34,7 +34,7 @@ func run() int {
 	var (
 		input       = flag.String("input", "", "FOFA 导出的 JSON 文件路径（必填）")
 		output      = flag.String("output", "derp.json", "输出 derpMap JSON 路径")
-		start       = flag.Int("start", 1000, "RegionID 起始编号")
+		start       = flag.Int("start", 900, "RegionID 起始编号（官方托管限制 900-999）")
 		limit       = flag.Int("limit", 50, "最多输出的节点数（按延迟取最低的 N 个），0 表示不限制")
 		maxLatency  = flag.Duration("max-latency", 100*time.Millisecond, "保留节点的中位延迟上限")
 		samples     = flag.Int("samples", 3, "每个节点 ping 采样次数（全部成功才保留）")
@@ -64,8 +64,9 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "错误: --timeout 和 --ping-timeout 必须 > 0")
 		return 2
 	}
-	if *start < 1 {
-		fmt.Fprintln(os.Stderr, "错误: --start 必须 >= 1")
+	// 官方托管硬性限制：自定义 RegionID 只能用 900-999，且一个 Region 只能放 1 台 DERP
+	if *start < 900 || *start > 999 {
+		fmt.Fprintln(os.Stderr, "错误: --start 必须在 900-999 范围内（官方托管自定义区域 ID 范围）")
 		return 2
 	}
 
@@ -166,11 +167,14 @@ func run() int {
 		return 1
 	}
 
-	// 按延迟取最低的 limit 个
-	if *limit > 0 && len(ok) > *limit {
+	// 按延迟取前 N 个：N = min(可用数, --limit, 900-999 范围上限)。
+	// 官方托管限制自定义 RegionID 只能用 900-999（最多 100 个 Region），
+	// 且一个 Region 只放 1 台 DERP（本工具本来就是 1 Region 1 Node 结构）。
+	if n := maxOutput(*start, *limit, len(ok)); len(ok) > n {
 		sort.Slice(ok, func(i, j int) bool { return ok[i].RTT < ok[j].RTT })
-		fmt.Printf("可用节点 %d 个，按 --limit 取延迟最低的 %d 个。\n", len(ok), *limit)
-		ok = ok[:*limit]
+		fmt.Printf("可用节点 %d 个，取延迟最低的 %d 个（RegionID %d-%d）。\n",
+			len(ok), n, *start, *start+n-1)
+		ok = ok[:n]
 	}
 
 	m := BuildDERPMap(ok, *start)
@@ -307,6 +311,20 @@ func debugArgs() {
 	} else {
 		fmt.Fprintf(os.Stderr, "[debug] /proc/self/cmdline=%q\n", parseCmdline(data))
 	}
+}
+
+// maxOutput 计算最终输出的 Region 数量：
+// min(可用节点数, --limit(如设置), 900-999 范围内容量)。
+// 官方托管硬性限制自定义 RegionID 只能用 900-999（最多 100 个）。
+func maxOutput(start, limit, available int) int {
+	maxOut := 999 - start + 1
+	if limit > 0 && limit < maxOut {
+		maxOut = limit
+	}
+	if available < maxOut {
+		maxOut = available
+	}
+	return maxOut
 }
 
 // parseCmdline 解析 /proc/self/cmdline 的原始字节（以 \0 分隔，末尾也有 \0），

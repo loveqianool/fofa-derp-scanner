@@ -47,7 +47,7 @@ docker run --rm -v $(pwd):/data ghcr.io/loveqianool/fofa-derp-scanner:latest \
 Usage of derp-scan:
   -input string        FOFA 导出的 JSON 文件路径（必填）
   -output string       输出 derpMap JSON 路径（默认 "derp.json"）
-  -start int           RegionID 起始编号（默认 1000）
+  -start int           RegionID 起始编号（官方托管限制 900-999，默认 900）
   -limit int           最多输出的节点数，按延迟取最低的 N 个（默认 50，0 为不限制）
   -max-latency duration
                        保留节点的中位延迟上限（默认 100ms）
@@ -79,7 +79,7 @@ Usage of derp-scan:
 ...
 可用节点 412 个，按 --limit 取延迟最低的 50 个。
 
-完成：50/2634 个节点可用（中位延迟 ≤ 100ms），已按延迟排序并从 1000 重新编号，写入 derp.json
+完成：50/2634 个节点可用（中位延迟 ≤ 100ms），已按延迟排序并从 900 重新编号，写入 derp.json
 ```
 
 ## Docker 镜像
@@ -122,6 +122,8 @@ FOFA JSON → 解析去重 → 并发探测 → 筛选 → 排序编号 → derp
 5. 发送 N 次 ping，取中位 RTT；任一次失败则丢弃该节点
 
 保留条件：全部 ping 成功 **且** 中位延迟 ≤ `--max-latency`。结果按延迟升序、从 `--start` 连续编号，节点带 `InsecureForTests: true`（跳过证书校验，Tailscale 客户端直连即用）。
+
+> 官方托管硬性限制：自定义 RegionID 只能用 **900–999**（最多 100 个 Region），且一个 Region 只能放 1 台 DERP。本工具默认 `--start 900`，输出即 1 Region 1 Node 结构；若可用节点超出 900–999 容量会自动截断并提示。
 
 ## 与 v1 的区别
 
