@@ -36,6 +36,7 @@ func run() int {
 		concurrency = flag.Int("concurrency", 50, "并发探测数")
 		timeout     = flag.Duration("timeout", 20*time.Second, "单个节点探测总超时")
 		pingTimeout = flag.Duration("ping-timeout", 5*time.Second, "单次 ping 超时")
+		relayTest   = flag.Bool("relay-test", false, "额外验证客户端间中继转发（建两个客户端，A 发包 B 收），更严格")
 		showVersion = flag.Bool("version", false, "打印版本并退出")
 	)
 	flag.Parse()
@@ -83,8 +84,12 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "没有解析到有效节点（需要 ip + port）")
 		return 1
 	}
-	fmt.Printf("解析到 %d 个候选节点，开始探测（并发 %d，每节点 %d 次 ping）…\n",
-		len(assets), *concurrency, *samples)
+	relayMsg := ""
+	if *relayTest {
+		relayMsg = "，附加中继转发验证"
+	}
+	fmt.Printf("解析到 %d 个候选节点，开始探测（并发 %d，每节点 %d 次 ping%s）…\n",
+		len(assets), *concurrency, *samples, relayMsg)
 
 	cands := BuildCandidates(assets, *start)
 
@@ -116,7 +121,7 @@ func run() int {
 			if c.Asset.Domain != "" {
 				host = c.Asset.Domain
 			}
-			rtt, err := ProbeDERP(pctx, host, c.Asset.Port, *samples, *pingTimeout)
+			rtt, err := ProbeDERP(pctx, host, c.Asset.Port, *samples, *pingTimeout, *relayTest)
 
 			mu.Lock()
 			defer mu.Unlock()

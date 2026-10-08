@@ -9,6 +9,7 @@
 ## 特性
 
 - **真 DERP 协议探测**：TCP 建连 → TLS 握手 → HTTP Upgrade → DERP 握手 → 多次 ping 取中位 RTT，只有完整走通 DERP 协议的节点才会被保留（旧版只测 TLS 握手，会把大量"握手通但不中继"的节点误判为可用）
+- **可选的中继转发验证**（`--relay-test`）：在同一服务器上建立两个客户端，A 发包 B 收，验证服务器真正的客户端间转发能力，而不仅是 client↔server 的 ping
 - **一次跑完**：输入 FOFA 导出的 JSON，直接输出可粘贴进 Tailscale ACL 的 `derp.json`
 - **并发探测**：默认 50 并发，2600+ 节点几分钟扫完
 - **多格式兼容**：FOFA 网页导出的 JSON 数组 / JSON Lines / `{"results":[...]}` 包裹格式都能解析，按 `ip:port` 自动去重
@@ -55,6 +56,7 @@ Usage of derp-scan:
   -timeout duration    单节点探测总超时（默认 20s）
   -ping-timeout duration
                        单次 ping 超时（默认 5s）
+  -relay-test          额外验证客户端间中继转发（建两个客户端，A 发包 B 收），更严格（默认 false）
   -version             打印版本并退出
 ```
 

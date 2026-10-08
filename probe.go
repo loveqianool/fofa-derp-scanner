@@ -26,18 +26,34 @@ import (
 // DERP 握手(ServerKey/ClientInfo) -> 发送 samples 次 ping 取中位 RTT。
 // 任何一步失败都返回 error，调用方可视为节点不可用。
 // 若 TLS 握手发现对端是明文 HTTP（如 80 端口），自动降级为明文探测。
-func ProbeDERP(ctx context.Context, host string, port int, samples int, pingTimeout time.Duration) (time.Duration, error) {
+// relayTest 为 true 时，额外验证服务器真正的客户端间中继转发
+// （建立两个客户端，A 发包、B 收包），比单纯 ping 更严格。
+func ProbeDERP(ctx context.Context, host string, port int, samples int, pingTimeout time.Duration, relayTest bool) (time.Duration, error) {
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
 
-	rtt, err := probeOnce(ctx, addr, true, samples, pingTimeout)
-	if err == nil {
-		return rtt, nil
-	}
-	if !isPlaintextHint(err) {
+	rtt, useTLS, err := probeOnceWithFallback(ctx, addr, samples, pingTimeout)
+	if err != nil {
 		return 0, err
 	}
+	if relayTest {
+		if err := probeRelay(ctx, addr, useTLS, pingTimeout); err != nil {
+			return 0, err
+		}
+	}
+	return rtt, nil
+}
+
+// probeOnceWithFallback 先尝试 TLS 探测；若 TLS 握手发现对端是明文 HTTP，
+// 则降级为明文探测。返回 RTT 和最终使用的 useTLS。
+func probeOnceWithFallback(ctx context.Context, addr string, samples int, pingTimeout time.Duration) (time.Duration, bool, error) {
+	if rtt, err := probeOnce(ctx, addr, true, samples, pingTimeout); err == nil {
+		return rtt, true, nil
+	} else if !isPlaintextHint(err) {
+		return 0, false, err
+	}
 	// 对端不是 TLS，重新拨号做明文 HTTP Upgrade 探测
-	return probeOnce(ctx, addr, false, samples, pingTimeout)
+	rtt, err := probeOnce(ctx, addr, false, samples, pingTimeout)
+	return rtt, false, err
 }
 
 // isPlaintextHint 判断 err 是否为"对端返回的不是 TLS 记录"——
@@ -47,11 +63,145 @@ func isPlaintextHint(err error) bool {
 }
 
 func probeOnce(ctx context.Context, addr string, useTLS bool, samples int, pingTimeout time.Duration) (time.Duration, error) {
+	conn, dc, err := dialDERP(ctx, addr, useTLS, key.NewNode(), pingTimeout)
+	if err != nil {
+		return 0, err
+	}
+	defer conn.Close()
+
+	rtts := make([]time.Duration, 0, samples)
+	for i := 0; i < samples; i++ {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		rtt, err := pingOnce(ctx, dc, conn, pingTimeout)
+		if err != nil {
+			return 0, err
+		}
+		rtts = append(rtts, rtt)
+	}
+	conn.SetDeadline(time.Time{})
+
+	sort.Slice(rtts, func(i, j int) bool { return rtts[i] < rtts[j] })
+	return rtts[len(rtts)/2], nil
+}
+
+// pingOnce 发送一次 ping 并等待对应的 pong，返回 RTT。
+// 会忽略 pong 之外的其他帧（keepalive、serverinfo 等）。
+func pingOnce(ctx context.Context, dc *derp.Client, conn net.Conn, timeout time.Duration) (time.Duration, error) {
+	var nonce [8]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return 0, err
+	}
+	conn.SetDeadline(time.Now().Add(timeout)) // 保障写超时；读超时由 recvWithTimeout 控制
+	start := time.Now()
+	if err := dc.SendPing(nonce); err != nil {
+		return 0, fmt.Errorf("ping 发送: %w", err)
+	}
+	for {
+		m, err := recvWithTimeout(ctx, dc, conn, timeout)
+		if err != nil {
+			return 0, fmt.Errorf("pong 等待: %w", err)
+		}
+		if pong, ok := m.(derp.PongMessage); ok && [8]byte(pong) == nonce {
+			return time.Since(start), nil
+		}
+	}
+}
+
+// recvWithTimeout 调用 dc.Recv，但最多等待 timeout。
+// 注意：derp.Client.Recv 内部硬编码了 120 秒读 deadline，每次调用都会
+// 覆盖我们设置的 conn deadline，因此这里用 goroutine + 超时关闭连接的
+// 方式来实现真正的超时——关闭连接会立即中断阻塞中的 Recv，不泄漏 goroutine。
+func recvWithTimeout(ctx context.Context, dc *derp.Client, conn net.Conn, timeout time.Duration) (derp.ReceivedMessage, error) {
+	type res struct {
+		m   derp.ReceivedMessage
+		err error
+	}
+	ch := make(chan res, 1)
+	go func() {
+		m, err := dc.Recv()
+		ch <- res{m, err}
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case r := <-ch:
+		return r.m, r.err
+	case <-timer.C:
+		conn.Close() // 中断阻塞中的 Recv
+		<-ch         // 等其返回（应立即失败）
+		return nil, fmt.Errorf("等待响应超时（%v）", timeout)
+	case <-ctx.Done():
+		conn.Close()
+		<-ch
+		return nil, ctx.Err()
+	}
+}
+
+// probeRelay 验证服务器真正的客户端间中继转发能力：在同一服务器上建立
+// 两个 DERP 客户端 A 和 B，A 发包给 B，B 必须能收到。
+// 这比 ping 更进一步——ping 只证明 client<->server 通，
+// 这里验证的才是中继的实际用法：server 在两个 client 之间转发。
+func probeRelay(ctx context.Context, addr string, useTLS bool, timeout time.Duration) error {
+	keyA := key.NewNode()
+	keyB := key.NewNode()
+
+	connA, dcA, err := dialDERP(ctx, addr, useTLS, keyA, timeout)
+	if err != nil {
+		return fmt.Errorf("客户端 A 建连: %w", err)
+	}
+	defer connA.Close()
+	connB, dcB, err := dialDERP(ctx, addr, useTLS, keyB, timeout)
+	if err != nil {
+		return fmt.Errorf("客户端 B 建连: %w", err)
+	}
+	defer connB.Close()
+
+	// B 先 ping 一次：证明 B 已被服务器接纳（enrollment 完成）。
+	// 否则 A 的包可能因 B 尚未注册而被丢弃，造成误判。
+	if _, err := pingOnce(ctx, dcB, connB, timeout); err != nil {
+		return fmt.Errorf("客户端 B 自检: %w", err)
+	}
+
+	payload := []byte("derp-scan relay probe")
+	connA.SetDeadline(time.Now().Add(timeout))
+	connB.SetDeadline(time.Now().Add(timeout))
+	if err := dcA.Send(keyB.Public(), payload); err != nil {
+		return fmt.Errorf("A 发送: %w", err)
+	}
+	for {
+		m, err := recvWithTimeout(ctx, dcB, connB, timeout)
+		if err != nil {
+			return fmt.Errorf("B 接收: %w", err)
+		}
+		if rp, ok := m.(derp.ReceivedPacket); ok {
+			if rp.Source == keyA.Public() && string(rp.Data) == string(payload) {
+				return nil
+			}
+			// 收到非预期的包，继续等
+			continue
+		}
+		// 忽略 pong 等其他帧
+	}
+}
+
+// dialDERP 完成到 addr 的 TCP 建连、TLS 握手（可选）、HTTP Upgrade 到 DERP
+// 以及 DERP 握手（ServerKey/ClientInfo），返回顶层连接和 client。
+// 调用方负责 Close(conn)。timeout 用于握手阶段的整体 deadline。
+func dialDERP(ctx context.Context, addr string, useTLS bool, privKey key.NodePrivate, timeout time.Duration) (net.Conn, *derp.Client, error) {
 	rawConn, err := dialTarget(ctx, addr)
 	if err != nil {
-		return 0, fmt.Errorf("tcp: %w", err)
+		return nil, nil, fmt.Errorf("tcp: %w", err)
 	}
-	defer rawConn.Close()
+	// 出错时关闭底层连接；成功后由调用方关闭返回的 conn
+	//（会级联关闭到底层）。
+	failed := true
+	defer func() {
+		if failed {
+			rawConn.Close()
+		}
+	}()
 
 	var conn net.Conn = rawConn
 	scheme := "http"
@@ -67,7 +217,7 @@ func probeOnce(ctx context.Context, addr string, useTLS bool, samples int, pingT
 		}
 		tlsConn := tls.Client(rawConn, tlsConf)
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
-			return 0, fmt.Errorf("tls: %w", err)
+			return nil, nil, fmt.Errorf("tls: %w", err)
 		}
 		conn = tlsConn
 		scheme = "https"
@@ -78,63 +228,35 @@ func probeOnce(ctx context.Context, addr string, useTLS bool, samples int, pingT
 	bw := bufio.NewWriter(conn)
 	req, err := http.NewRequest("GET", scheme+"://"+addr+"/derp", nil)
 	if err != nil {
-		return 0, err
+		return nil, nil, err
 	}
 	req.Header.Set("Upgrade", "DERP")
 	req.Header.Set("Connection", "Upgrade")
-	conn.SetDeadline(time.Now().Add(pingTimeout))
+	conn.SetDeadline(time.Now().Add(timeout))
 	if err := req.Write(bw); err != nil {
-		return 0, fmt.Errorf("upgrade 请求: %w", err)
+		return nil, nil, fmt.Errorf("upgrade 请求: %w", err)
 	}
 	if err := bw.Flush(); err != nil {
-		return 0, fmt.Errorf("upgrade 请求: %w", err)
+		return nil, nil, fmt.Errorf("upgrade 请求: %w", err)
 	}
 	resp, err := http.ReadResponse(br, req)
 	if err != nil {
-		return 0, fmt.Errorf("upgrade 响应: %w", err)
+		return nil, nil, fmt.Errorf("upgrade 响应: %w", err)
 	}
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusSwitchingProtocols {
-		return 0, fmt.Errorf("upgrade 被拒绝: HTTP %d", resp.StatusCode)
+		return nil, nil, fmt.Errorf("upgrade 被拒绝: HTTP %d", resp.StatusCode)
 	}
 
 	// DERP 握手：服务端下发 ServerKey，客户端回 ClientInfo（内部处理 nacl 加密）
 	brw := bufio.NewReadWriter(br, bw)
-	dc, err := derp.NewClient(key.NewNode(), conn, brw, logger.Discard, derp.IsProber(true))
+	dc, err := derp.NewClient(privKey, conn, brw, logger.Discard, derp.IsProber(true))
 	if err != nil {
-		return 0, fmt.Errorf("derp 握手: %w", err)
+		return nil, nil, fmt.Errorf("derp 握手: %w", err)
 	}
 
-	rtts := make([]time.Duration, 0, samples)
-	for i := 0; i < samples; i++ {
-		if err := ctx.Err(); err != nil {
-			return 0, err
-		}
-		var nonce [8]byte
-		if _, err := rand.Read(nonce[:]); err != nil {
-			return 0, err
-		}
-		conn.SetDeadline(time.Now().Add(pingTimeout))
-		start := time.Now()
-		if err := dc.SendPing(nonce); err != nil {
-			return 0, fmt.Errorf("ping 发送: %w", err)
-		}
-		for {
-			m, err := dc.Recv()
-			if err != nil {
-				return 0, fmt.Errorf("pong 等待: %w", err)
-			}
-			if pong, ok := m.(derp.PongMessage); ok && [8]byte(pong) == nonce {
-				rtts = append(rtts, time.Since(start))
-				break
-			}
-			// 忽略其他帧（keepalive、serverinfo 等）
-		}
-	}
-	conn.SetDeadline(time.Time{})
-
-	sort.Slice(rtts, func(i, j int) bool { return rtts[i] < rtts[j] })
-	return rtts[len(rtts)/2], nil
+	failed = false
+	return conn, dc, nil
 }
 
 // dialTarget 建立到 addr 的 TCP 连接。如果环境变量中配置了代理
