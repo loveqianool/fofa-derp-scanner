@@ -1,7 +1,7 @@
 name: Release
 
 # 打 tag 即发版，例如：git tag v2.0.0 && git push origin v2.0.0
-# 自动编译 5 平台静态二进制并挂到 GitHub Release 上。
+# 自动编译 4 平台静态二进制并挂到 GitHub Release 上。
 
 on:
   push:
@@ -20,8 +20,7 @@ jobs:
           - { goos: linux, goarch: amd64, suffix: '' }
           - { goos: linux, goarch: arm64, suffix: '' }
           - { goos: windows, goarch: amd64, suffix: '.exe' }
-          - { goos: darwin, goarch: amd64, suffix: '' }
-          - { goos: darwin, goarch: arm64, suffix: '' }
+          - { goos: android, goarch: arm64, suffix: '' }
     steps:
       - name: Checkout
         uses: actions/checkout@v5
