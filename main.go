@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"sync"
 	"syscall"
@@ -159,7 +160,8 @@ func run() int {
 		return 1
 	}
 	out = append(out, '\n')
-	if err := os.WriteFile(*output, out, 0644); err != nil {
+	// 原子写入：先写临时文件再 rename，避免 Ctrl+C 等中断留下半截文件
+	if err := writeFileAtomic(*output, out); err != nil {
 		fmt.Fprintf(os.Stderr, "写入输出文件失败: %v\n", err)
 		return 1
 	}
@@ -168,6 +170,28 @@ func run() int {
 		len(ok), len(cands), *maxLatency, *start, *output)
 	fmt.Println("下一步：把该文件中 Regions 下的内容粘贴到 Tailscale ACL 的 derpMap.Regions 里。")
 	return 0
+}
+
+// writeFileAtomic 原子写入文件：先写同目录临时文件再 rename，
+// 避免写入过程中被中断留下半截文件。
+func writeFileAtomic(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".derp-scan-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // 成功 rename 后删除已不存在，无害
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 // shortErr 把多层 wrapped error 压成最后一句，日志更干净。
