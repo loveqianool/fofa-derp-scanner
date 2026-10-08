@@ -1,15 +1,36 @@
-# Ignore macOS files
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+derp-scan
+derp-scan-*
+dist/
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Go workspace file
+go.work
+go.work.sum
+
+# Build cache (not needed in repo)
+/tmp/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
 .DS_Store
+Thumbs.db
 
-# Ignore actual data and configuration files to protect user data
-config/*.json
-config/*.html
-*.json
-*.html
-
-# Allow .gitkeep to keep the config directory
-!config/.gitkeep
-
-# Ignore Python cache
-__pycache__/
-*.pyc
+# Scan outputs (user's own data, don't commit)
+derp.json
+fofa*.json
