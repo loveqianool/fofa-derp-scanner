@@ -214,25 +214,40 @@ func writeFileAtomic(path string, data []byte) error {
 	return os.Rename(tmpName, path)
 }
 
-// fixArgs 兜底：如果 Go 运行时没有拿到命令行参数（os.Args 为空或只有
-// 程序名），则尝试从 /proc/self/cmdline 重建。
+// fixArgs 兜底：必须在 flag.Parse() 之前调用。
 //
-// 背景：某些 Android 设备/ROM 上，Go 程序经 /system/bin/linker64 加载时，
-// argv 在 linker 到 _rt0 的交接中丢失，导致 flag.Parse() 看不到任何参数；
-// 但内核在 execve 时写入的 /proc/self/cmdline 不经过这条链路，内容是完整的。
-// 必须在 flag.Parse() 之前调用。非 Linux/Android 平台上 /proc 不存在，
-// 会静默跳过，无任何影响。
+// 1. 某些 Android 设备/ROM 上，Go 程序经 /system/bin/linker64 加载时，
+//    argv 在 linker 到 _rt0 的交接中丢失，此时尝试从 /proc/self/cmdline
+//    （内核在 execve 时写入，不经过该链路）重建。
+// 2. 某些环境会把二进制绝对路径作为 argv[1] 重复插入，导致真实参数整体
+//    后移一位（flag.Parse 只看 os.Args[1:]，遇到首个非 flag 参数即停止，
+//    后面的 -version/--input 全被吞掉）。检测到 argv[1] 与 argv[0] 指向
+//    同一文件时删掉它。
+//
+// 非 Linux/Android 平台上 /proc 不存在，会静默跳过，无任何影响。
 func fixArgs() {
-	if len(os.Args) > 1 {
-		return
+	if len(os.Args) <= 1 {
+		if data, err := os.ReadFile("/proc/self/cmdline"); err == nil && len(data) > 0 {
+			if args := parseCmdline(data); len(args) > 1 {
+				os.Args = args
+			}
+		}
 	}
-	data, err := os.ReadFile("/proc/self/cmdline")
-	if err != nil || len(data) == 0 {
-		return
+	// 去掉重复插入的 argv[1]（与 argv[0] 指向同一文件）
+	os.Args = dedupArgv(os.Args)
+}
+
+// dedupArgv：如果 argv[1] 与 argv[0] 指向同一文件（绝对路径相同），
+// 则删掉 argv[1]，让真实参数回到正确位置。否则原样返回。
+func dedupArgv(args []string) []string {
+	if len(args) >= 3 {
+		p0, err0 := filepath.Abs(args[0])
+		p1, err1 := filepath.Abs(args[1])
+		if err0 == nil && err1 == nil && p0 == p1 {
+			return append([]string{args[0]}, args[2:]...)
+		}
 	}
-	if args := parseCmdline(data); len(args) > 1 {
-		os.Args = args
-	}
+	return args
 }
 
 // resolveParam 按优先级解析参数：命令行 flag 值 → 环境变量 → 默认值。
