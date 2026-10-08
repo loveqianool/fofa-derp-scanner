@@ -1,6 +1,6 @@
 module derpscan
 
-go 1.27.2
+go 1.27.1
 
 require tailscale.com v1.104.1
 
