@@ -17,6 +17,9 @@ import (
 	"time"
 )
 
+// version 由构建时 -ldflags "-X main.version=..." 注入，默认为 dev。
+var version = "dev"
+
 func main() {
 	os.Exit(run())
 }
@@ -32,8 +35,32 @@ func run() int {
 		concurrency = flag.Int("concurrency", 50, "并发探测数")
 		timeout     = flag.Duration("timeout", 20*time.Second, "单个节点探测总超时")
 		pingTimeout = flag.Duration("ping-timeout", 5*time.Second, "单次 ping 超时")
+		showVersion = flag.Bool("version", false, "打印版本并退出")
 	)
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("derp-scan %s\n", version)
+		return 0
+	}
+
+	// 参数合法性校验：非法值会导致死锁或 panic，提前拦截
+	if *concurrency < 1 {
+		fmt.Fprintln(os.Stderr, "错误: --concurrency 必须 >= 1")
+		return 2
+	}
+	if *samples < 1 {
+		fmt.Fprintln(os.Stderr, "错误: --samples 必须 >= 1")
+		return 2
+	}
+	if *timeout <= 0 || *pingTimeout <= 0 {
+		fmt.Fprintln(os.Stderr, "错误: --timeout 和 --ping-timeout 必须 > 0")
+		return 2
+	}
+	if *start < 1 {
+		fmt.Fprintln(os.Stderr, "错误: --start 必须 >= 1")
+		return 2
+	}
 
 	if *input == "" {
 		fmt.Fprintln(os.Stderr, "错误: 必须指定 --input")
