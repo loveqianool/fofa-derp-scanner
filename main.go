@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -26,6 +27,7 @@ func main() {
 }
 
 func run() int {
+	fixArgs() // 必须在 flag.Parse() 之前：某些 Android 设备上 Go 运行时拿不到 argv
 	var (
 		input       = flag.String("input", "", "FOFA 导出的 JSON 文件路径（必填）")
 		output      = flag.String("output", "derp.json", "输出 derpMap JSON 路径")
@@ -197,6 +199,40 @@ func writeFileAtomic(path string, data []byte) error {
 		return err
 	}
 	return os.Rename(tmpName, path)
+}
+
+// fixArgs 兜底：如果 Go 运行时没有拿到命令行参数（os.Args 为空或只有
+// 程序名），则尝试从 /proc/self/cmdline 重建。
+//
+// 背景：某些 Android 设备/ROM 上，Go 程序经 /system/bin/linker64 加载时，
+// argv 在 linker 到 _rt0 的交接中丢失，导致 flag.Parse() 看不到任何参数；
+// 但内核在 execve 时写入的 /proc/self/cmdline 不经过这条链路，内容是完整的。
+// 必须在 flag.Parse() 之前调用。非 Linux/Android 平台上 /proc 不存在，
+// 会静默跳过，无任何影响。
+func fixArgs() {
+	if len(os.Args) > 1 {
+		return
+	}
+	data, err := os.ReadFile("/proc/self/cmdline")
+	if err != nil || len(data) == 0 {
+		return
+	}
+	if args := parseCmdline(data); len(args) > 1 {
+		os.Args = args
+	}
+}
+
+// parseCmdline 解析 /proc/self/cmdline 的原始字节（以 \0 分隔，末尾也有 \0），
+// 返回参数列表。空片段会被丢弃。
+func parseCmdline(data []byte) []string {
+	parts := strings.Split(string(data), "\x00")
+	args := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p != "" {
+			args = append(args, p)
+		}
+	}
+	return args
 }
 
 // shortErr 把多层 wrapped error 压成最后一句，日志更干净。
