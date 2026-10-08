@@ -28,6 +28,9 @@ func main() {
 
 func run() int {
 	fixArgs() // 必须在 flag.Parse() 之前：某些 Android 设备上 Go 运行时拿不到 argv
+	if os.Getenv("DERP_SCAN_DEBUG") != "" {
+		debugArgs()
+	}
 	var (
 		input       = flag.String("input", "", "FOFA 导出的 JSON 文件路径（必填）")
 		output      = flag.String("output", "derp.json", "输出 derpMap JSON 路径")
@@ -66,13 +69,23 @@ func run() int {
 		return 2
 	}
 
-	if *input == "" {
-		fmt.Fprintln(os.Stderr, "错误: 必须指定 --input")
+	// 参数解析 fallback 链：命令行 flag → 环境变量 → 交互式输入。
+	// 某些 Android 设备上 argv 会损坏，环境变量和 stdin 是独立的输入通道。
+	inputPath := resolveParam(*input, "DERP_SCAN_INPUT", "")
+	outputPath := resolveParam(*output, "DERP_SCAN_OUTPUT", "")
+	if inputPath == "" && isTerminal() {
+		fmt.Print("FOFA JSON 文件路径: ")
+		if line, err := readLine(); err == nil {
+			inputPath = strings.TrimSpace(line)
+		}
+	}
+	if inputPath == "" {
+		fmt.Fprintln(os.Stderr, "错误: 必须指定 --input（或设置 DERP_SCAN_INPUT 环境变量）")
 		flag.Usage()
 		return 2
 	}
 
-	data, err := os.ReadFile(*input)
+	data, err := os.ReadFile(inputPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "读取输入文件失败: %v\n", err)
 		return 1
@@ -168,13 +181,13 @@ func run() int {
 	}
 	out = append(out, '\n')
 	// 原子写入：先写临时文件再 rename，避免 Ctrl+C 等中断留下半截文件
-	if err := writeFileAtomic(*output, out); err != nil {
+	if err := writeFileAtomic(outputPath, out); err != nil {
 		fmt.Fprintf(os.Stderr, "写入输出文件失败: %v\n", err)
 		return 1
 	}
 
 	fmt.Printf("\n完成：%d/%d 个节点可用（中位延迟 ≤ %v），已按延迟排序并从 %d 重新编号，写入 %s\n",
-		len(ok), len(cands), *maxLatency, *start, *output)
+		len(ok), len(cands), *maxLatency, *start, outputPath)
 	fmt.Println("下一步：把该文件中 Regions 下的内容粘贴到 Tailscale ACL 的 derpMap.Regions 里。")
 	return 0
 }
@@ -219,6 +232,65 @@ func fixArgs() {
 	}
 	if args := parseCmdline(data); len(args) > 1 {
 		os.Args = args
+	}
+}
+
+// resolveParam 按优先级解析参数：命令行 flag 值 → 环境变量 → 默认值。
+// flagVal 为空（用户未通过 flag 指定）时才看环境变量。
+func resolveParam(flagVal, envKey, def string) string {
+	if flagVal != "" {
+		return flagVal
+	}
+	if v := os.Getenv(envKey); v != "" {
+		return v
+	}
+	return def
+}
+
+// isTerminal 粗略判断 stdin 是否为终端（可交互输入）。
+// 用 /dev/tty 是否可打开来判断，避免引入 x/term 依赖。
+func isTerminal() bool {
+	f, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err != nil {
+		return false
+	}
+	f.Close()
+	return true
+}
+
+// readLine 从 stdin 读一行（去掉末尾换行）。
+func readLine() (string, error) {
+	var line []byte
+	buf := make([]byte, 1)
+	for {
+		n, err := os.Stdin.Read(buf)
+		if n > 0 {
+			if buf[0] == '\n' {
+				break
+			}
+			line = append(line, buf[0])
+		}
+		if err != nil {
+			break
+		}
+	}
+	if len(line) == 0 {
+		return "", fmt.Errorf("no input")
+	}
+	return strings.TrimRight(string(line), "\r"), nil
+}
+
+// debugArgs 打印进程实际拿到的参数信息，用于诊断 argv 丢失问题。
+// 设置 DERP_SCAN_DEBUG=1 触发。
+func debugArgs() {
+	fmt.Fprintf(os.Stderr, "[debug] len(os.Args)=%d\n", len(os.Args))
+	for i, a := range os.Args {
+		fmt.Fprintf(os.Stderr, "[debug] os.Args[%d]=%q\n", i, a)
+	}
+	if data, err := os.ReadFile("/proc/self/cmdline"); err != nil {
+		fmt.Fprintf(os.Stderr, "[debug] /proc/self/cmdline 读取失败: %v\n", err)
+	} else {
+		fmt.Fprintf(os.Stderr, "[debug] /proc/self/cmdline=%q\n", parseCmdline(data))
 	}
 }
 
