@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -140,11 +141,44 @@ func probeOnce(ctx context.Context, addr string, useTLS bool, samples int, pingT
 // （HTTPS_PROXY/HTTP_PROXY，含 NO_PROXY 处理），则通过 HTTP CONNECT
 // 隧道建连；否则直连。
 func dialTarget(ctx context.Context, addr string) (net.Conn, error) {
-	proxyURL, err := http.ProxyFromEnvironment(&http.Request{URL: &url.URL{Scheme: "https", Host: addr}})
-	if err != nil || proxyURL == nil {
-		return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	if proxyURL := proxyForTarget(addr); proxyURL != nil {
+		return dialViaCONNECT(ctx, proxyURL, addr)
 	}
-	return dialViaCONNECT(ctx, proxyURL, addr)
+	return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+}
+
+// proxyForTarget 返回适用于 addr 的代理 URL。
+// Go 的 http.ProxyFromEnvironment 不会为 https 目标回落到 HTTP_PROXY
+// （curl 会），这里在 HTTPS_PROXY 完全未设置时手动补上；
+// 若 HTTPS_PROXY 已设置则完全走标准逻辑，避免绕过 NO_PROXY。
+func proxyForTarget(addr string) *url.URL {
+	req := &http.Request{URL: &url.URL{Scheme: "https", Host: addr}}
+	if pu, err := http.ProxyFromEnvironment(req); err == nil && pu != nil {
+		return pu
+	}
+	if os.Getenv("HTTPS_PROXY") != "" || os.Getenv("https_proxy") != "" {
+		return nil
+	}
+	return proxyFromHTTPOnly()
+}
+
+// proxyFromHTTPOnly 在 HTTPS_PROXY 未设置时，从 HTTP_PROXY 取代理地址
+// （curl 的行为）。单独拆出来以便测试（http.ProxyFromEnvironment 内部
+// 有 sync.Once 缓存，直接测它会受测试执行顺序影响）。
+func proxyFromHTTPOnly() *url.URL {
+	for _, k := range []string{"HTTP_PROXY", "http_proxy"} {
+		v := strings.TrimSpace(os.Getenv(k))
+		if v == "" {
+			continue
+		}
+		if !strings.Contains(v, "://") {
+			v = "http://" + v
+		}
+		if pu, err := url.Parse(v); err == nil && pu.Host != "" {
+			return pu
+		}
+	}
+	return nil
 }
 
 // dialViaCONNECT 通过代理的 HTTP CONNECT 方法建立到 target 的隧道。
