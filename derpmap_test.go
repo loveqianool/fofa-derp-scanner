@@ -70,3 +70,78 @@ func TestDERPMapJSONFields(t *testing.T) {
 		}
 	}
 }
+
+// TestParseRegionQuotas 验证 --region 配额语法的解析。
+func TestParseRegionQuotas(t *testing.T) {
+	// 空
+	if q, err := parseRegionQuotas(""); err != nil || len(q) != 0 {
+		t.Fatalf("空应返回 nil,nil，got %v,%v", q, err)
+	}
+	// 标准配额
+	q, err := parseRegionQuotas("guangzhou:20,hongkong:20,shanghai:20")
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if len(q) != 3 || q[0].Pattern != "guangzhou" || q[0].Count != 20 ||
+		q[1].Pattern != "hongkong" || q[1].Count != 20 ||
+		q[2].Pattern != "shanghai" || q[2].Count != 20 {
+		t.Fatalf("配额解析错误: %+v", q)
+	}
+	// 省略 :数量 表示不限量
+	q, err = parseRegionQuotas("Hong Kong")
+	if err != nil || len(q) != 1 || q[0].Pattern != "Hong Kong" || q[0].Count != 0 {
+		t.Fatalf("不限量解析错误: %+v,%v", q, err)
+	}
+	// 非法数量
+	if _, err := parseRegionQuotas("hk:abc"); err == nil {
+		t.Fatal("hk:abc 应报错")
+	}
+	if _, err := parseRegionQuotas("hk:-1"); err == nil {
+		t.Fatal("hk:-1 应报错")
+	}
+	if _, err := parseRegionQuotas("hk:"); err == nil {
+		t.Fatal("hk: 应报错")
+	}
+}
+
+// TestTryParseDERPMap 验证 derpMap 中间文件格式的自动识别。
+func TestTryParseDERPMap(t *testing.T) {
+	// derpMap 格式应被识别
+	dmJSON := `{"Regions":{"900":{"RegionID":900,"RegionCode":"custom900","RegionName":"Hong Kong","Nodes":[{"Name":"900-x","RegionID":900,"HostName":"x","DERPPort":443,"LatencyMs":38}]}}}`
+	dm, ok := tryParseDERPMap([]byte(dmJSON))
+	if !ok || dm == nil {
+		t.Fatal("derpMap 应被识别")
+	}
+	if dm.Regions["900"].Nodes[0].LatencyMs != 38 {
+		t.Fatalf("LatencyMs 未解析: %+v", dm.Regions["900"].Nodes[0])
+	}
+	// FOFA 格式不应被识别为 derpMap
+	fofaJSON := `[{"ip":"1.1.1.1","port":443,"city":"Hong Kong"}]`
+	if _, ok := tryParseDERPMap([]byte(fofaJSON)); ok {
+		t.Fatal("FOFA JSON 不应被识别为 derpMap")
+	}
+	// 空 Regions 不应被识别
+	if _, ok := tryParseDERPMap([]byte(`{"Regions":{}}`)); ok {
+		t.Fatal("空 Regions 不应被识别")
+	}
+	// 非法 JSON
+	if _, ok := tryParseDERPMap([]byte(`{xxx`)); ok {
+		t.Fatal("非法 JSON 不应被识别")
+	}
+}
+
+// TestMatchRegion 验证区域名匹配（大小写/空格不敏感）。
+func TestMatchRegion(t *testing.T) {
+	if !matchRegion("Hong Kong", []string{"hongkong"}) {
+		t.Error("hongkong 应匹配 Hong Kong")
+	}
+	if !matchRegion("Hong Kong", []string{"Hong Kong"}) {
+		t.Error("Hong Kong 应匹配自身")
+	}
+	if matchRegion("Guangzhou", []string{"hongkong"}) {
+		t.Error("Guangzhou 不应匹配 hongkong")
+	}
+	if matchRegion("", []string{"hk"}) {
+		t.Error("空城市名不应匹配")
+	}
+}

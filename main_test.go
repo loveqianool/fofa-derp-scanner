@@ -61,21 +61,43 @@ func TestDedupArgv(t *testing.T) {
 	}
 }
 
-// TestMaxOutput 验证 900-999 范围上限与 --limit 的取小逻辑。
-func TestMaxOutput(t *testing.T) {
-	cases := []struct{ start, limit, avail, want int }{
-		{900, 50, 929, 50},   // limit 最小
-		{900, 0, 929, 100},   // 不限量时被 900-999 卡到 100
-		{900, 0, 30, 30},     // 可用数不足
-		{950, 0, 200, 50},    // start=950 时只剩 50 个 ID
-		{999, 0, 200, 1},     // 只剩 1 个 ID
-		{900, 200, 500, 100}, // limit 超过范围上限仍被卡到 100
-		{900, 100, 500, 100}, // limit 恰好等于上限
+
+// TestApplyQuotas 验证按区域配额选取：各取延迟最低的 N 个，配额顺序保留，不重复。
+func TestApplyQuotas(t *testing.T) {
+	mk := func(region string, latency int64) flatNode {
+		return flatNode{regionName: region, node: Node{HostName: region, LatencyMs: latency}}
 	}
-	for _, c := range cases {
-		if got := maxOutput(c.start, c.limit, c.avail); got != c.want {
-			t.Errorf("maxOutput(%d,%d,%d)=%d, want %d",
-				c.start, c.limit, c.avail, got, c.want)
+	all := []flatNode{
+		mk("Guangzhou", 50), mk("Guangzhou", 20), mk("Guangzhou", 80),
+		mk("Hong Kong", 60), mk("Hong Kong", 10), mk("Hong Kong", 90),
+		mk("Shanghai", 30),
+	}
+	quotas := []RegionQuota{
+		{Pattern: "guangzhou", Count: 2},
+		{Pattern: "hongkong", Count: 2},
+		{Pattern: "shanghai", Count: 5}, // 只有 1 个，全取
+	}
+	sel, err := applyQuotas(all, quotas)
+	if err != nil {
+		t.Fatalf("applyQuotas 失败: %v", err)
+	}
+	if len(sel) != 5 {
+		t.Fatalf("应选中 5 个，got %d", len(sel))
+	}
+	// 配额顺序：先广州（20,50），再香港（10,60），再上海（30）
+	want := []int64{20, 50, 10, 60, 30}
+	for i, w := range want {
+		if sel[i].node.LatencyMs != w {
+			t.Errorf("sel[%d] 延迟=%d, want %d", i, sel[i].node.LatencyMs, w)
 		}
+	}
+	// 零匹配应报错
+	if _, err := applyQuotas(all, []RegionQuota{{Pattern: "tokyo", Count: 2}}); err == nil {
+		t.Error("tokyo 零匹配应报错")
+	}
+	// 不限量（Count=0）取全部
+	sel, err = applyQuotas(all, []RegionQuota{{Pattern: "guangzhou"}})
+	if err != nil || len(sel) != 3 {
+		t.Fatalf("不限量应取 3 个广州节点，got %d,%v", len(sel), err)
 	}
 }

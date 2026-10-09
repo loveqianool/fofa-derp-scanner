@@ -41,14 +41,16 @@ docker run --rm -v $(pwd):/data ghcr.io/loveqianool/fofa-derp-scanner:latest \
 2. 把 `derp.json` 中 `Regions` 下的内容粘贴进 `derpMap.Regions`
 3. 保存。客户端会自动选用延迟最低的可用节点，可用 `tailscale status` 查看当前连的是哪个节点。
 
-## 用法
+## 用法（三段式工作流）
+
+工具根据 `--input` 的文件格式自动切换模式：FOFA 导出 → 扫描模式；derp-all.json（derpMap 格式）→ 筛选模式。
 
 ```
 Usage of derp-scan:
-  -input string        FOFA 导出的 JSON 文件路径（必填）
+  -input string        输入文件：FOFA 导出的 JSON（扫描模式）或 derp-all.json（筛选模式，自动识别）
   -output string       输出 derpMap JSON 路径（默认 "derp.json"）
+  -check string        复检模式：重新探测指定 derp-all.json 中的节点，剔除不可用的并原地更新
   -start int           RegionID 起始编号（官方托管限制 900-999，默认 900）
-  -limit int           最多输出的节点数，按延迟取最低的 N 个（默认 50，0 为不限制）
   -max-latency duration
                        保留节点的中位延迟上限（默认 100ms）
   -samples int         每节点 ping 采样次数，全部成功才保留（默认 3）
@@ -57,33 +59,54 @@ Usage of derp-scan:
   -ping-timeout duration
                        单次 ping 超时（默认 5s）
   -relay-test          额外验证客户端间中继转发（建两个客户端，A 发包 B 收），更严格（默认 false）
-  -region string       只保留指定区域的节点（按 FOFA 城市名过滤，逗号分隔多个，不区分大小写），如 "Hong Kong"
+  -region string       筛选模式按区域配额选取，如 "guangzhou:20,hongkong:20"（省略 :数量 则取该区域全部），逗号分隔多个
   -version             打印版本并退出
 ```
 
-示例：
+### 1. 扫描：FOFA → derp-all.json（全量，无截断）
 
 ```bash
-# 取延迟最低的 100 个，延迟上限放宽到 200ms
-./derp-scan --input fofa.json --output derp.json --limit 100 --max-latency 200ms
-
-# 只要香港的 20 个最低延迟节点
-./derp-scan --input fofa.json --output derp.json --region "Hong Kong" --limit 20
-
-# 多个区域逗号分隔（大小写/空格不敏感）
-./derp-scan --input fofa.json --output derp.json --region "hongkong,singapore" --limit 20
+./derp-scan --input fofa.json --output derp-all.json
 ```
 
-输出示例：
+输出全部可用节点（按延迟排序，每个节点带 `LatencyMs` 延迟字段，方便后续筛选）。
+注意这是中间文件，节点数可能超过 100（RegionID 会超出 999），不要直接粘贴到 ACL。
+
+### 2. 筛选：derp-all.json → derp.json（按区域配额，不重新探测）
+
+```bash
+# 20 个广东 + 20 个香港 + 20 个上海，各取延迟最低的，共 60 个
+./derp-scan --input derp-all.json --output derp.json --region "guangzhou:20,hongkong:20,shanghai:20"
+
+# 不指定 --region 则取全部（按延迟排序）
+./derp-scan --input derp-all.json --output derp.json
+
+# 省略 :数量 表示取该区域全部
+./derp-scan --input derp-all.json --output derp.json --region "hongkong"
+```
+
+区域名大小写/空格不敏感（`hongkong` 能匹配 `Hong Kong`），写错名字会打印文件实际的区域分布供对照。
+输出会重新编号到 900-999（超 100 个自动截断）并去掉 `LatencyMs`，可直接粘贴到 Tailscale ACL。
+
+### 3. 复检：定期剔除 derp-all.json 中的死节点（原地更新）
+
+```bash
+./derp-scan --check derp-all.json
+```
+
+重新探测每个节点，剔除不可用/超时的，更新延迟后重排并原地写回。全部不可用时不会清空文件。
+
+输出示例（扫描模式）：
 
 ```
 解析到 2634 个候选节点，开始探测（并发 50，每节点 3 次 ping）…
-[1/2634] 1.2.3.4:443                   可用 38ms
+[1/2634] 1.2.3.4:443                   38ms
 [2/2634] 5.6.7.8:8443                  失败: connection refused
 ...
-可用节点 412 个，按 --limit 取延迟最低的 50 个。
 
-完成：50/2634 个节点可用（中位延迟 ≤ 100ms），已按延迟排序并从 900 重新编号，写入 derp.json
+完成：929/2634 个节点可用（中位延迟 ≤ 100ms），已按延迟排序并从 900 开始编号，写入 derp-all.json
+下一步：用筛选模式从该文件按区域配额选取节点，例如：
+  derp-scan --input derp-all.json --output derp.json --region "guangzhou:20,hongkong:20"
 ```
 
 ## Docker 镜像
@@ -156,7 +179,7 @@ docker buildx build --platform linux/amd64,linux/arm64 -t derp-scan .
 A: 两个工具标准不同。derpprober 的 tls 探测会校验证书（自签证书直接判失败），而本工具输出的节点都带 `InsecureForTests: true`，Tailscale 客户端会跳过证书校验。以本工具的真 ping 结果和 `tailscale status` 的实际连接为准。
 
 **Q: 扫出来可用节点太少？**
-A: 放宽 `--max-latency`（如 `200ms`）或 `--limit 0` 输出全部可用节点。
+A: 放宽 `--max-latency`（如 `200ms`）。扫描模式默认输出全部可用节点，不再截断。
 
 **Q: 需要走代理？**
 A: 设置 `HTTPS_PROXY` 环境变量即可，`NO_PROXY` 也会被遵守。

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"sort"
 	"strconv"
 	"strings"
 )
@@ -210,49 +209,4 @@ func matchRegion(city string, patterns []string) bool {
 		}
 	}
 	return false
-}
-
-// filterByRegion 按区域过滤资产。filter 为逗号分隔的多个模式，任一匹配即保留。
-// 空 filter 返回原列表。
-func filterByRegion(assets []Asset, filter string) []Asset {
-	if strings.TrimSpace(filter) == "" {
-		return assets
-	}
-	patterns := strings.Split(filter, ",")
-	out := make([]Asset, 0, len(assets))
-	for _, a := range assets {
-		if matchRegion(a.City, patterns) {
-			out = append(out, a)
-		}
-	}
-	return out
-}
-
-// RegionStat 统计某个城市的节点数。
-type RegionStat struct {
-	City  string
-	Count int
-}
-
-// listRegions 统计资产中各城市的节点数，按数量降序返回。空城市名记为"(未知)"。
-func listRegions(assets []Asset) []RegionStat {
-	counts := make(map[string]int)
-	for _, a := range assets {
-		city := a.City
-		if strings.TrimSpace(city) == "" {
-			city = "(未知)"
-		}
-		counts[city]++
-	}
-	stats := make([]RegionStat, 0, len(counts))
-	for city, n := range counts {
-		stats = append(stats, RegionStat{City: city, Count: n})
-	}
-	sort.Slice(stats, func(i, j int) bool {
-		if stats[i].Count != stats[j].Count {
-			return stats[i].Count > stats[j].Count
-		}
-		return stats[i].City < stats[j].City
-	})
-	return stats
 }

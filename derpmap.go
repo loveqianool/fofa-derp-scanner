@@ -1,9 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -30,6 +33,9 @@ type Node struct {
 	DERPPort         int    `json:"DERPPort"`
 	STUNPort         int    `json:"STUNPort,omitempty"`
 	InsecureForTests bool   `json:"InsecureForTests"`
+	// LatencyMs 是探测到的中位延迟（毫秒），只用于 derp-all.json 这类中间文件，
+	// 方便二次筛选时按延迟排序。最终粘贴到 ACL 的输出会去掉该字段（omitempty）。
+	LatencyMs int64 `json:"LatencyMs,omitempty"`
 }
 
 // Candidate 是待探测的候选节点：资产 + 探测结果。
@@ -95,6 +101,7 @@ func BuildDERPMap(cands []Candidate, start int) DERPMap {
 		for j := range region.Nodes {
 			region.Nodes[j].RegionID = rid
 			region.Nodes[j].Name = fmt.Sprintf("%d-%s", rid, displayName(c.Asset))
+			region.Nodes[j].LatencyMs = c.RTT.Milliseconds()
 		}
 		m.Regions[fmt.Sprintf("%d", rid)] = region
 	}
@@ -106,4 +113,65 @@ func displayName(a Asset) string {
 		return a.Domain
 	}
 	return a.IP
+}
+
+// RegionQuota 是 --region 的一条配额："区域名:数量"，如 "hongkong:20"。
+// Count 为 0 表示不限量（取该区域全部）。
+type RegionQuota struct {
+	Pattern string
+	Count   int
+}
+
+// parseRegionQuotas 解析 --region 参数："gz:20,hk:20" 或 "Hong Kong"（不限量）。
+// 模式大小写/空格不敏感（复用 normRegion）。
+func parseRegionQuotas(s string) ([]RegionQuota, error) {
+	if strings.TrimSpace(s) == "" {
+		return nil, nil
+	}
+	var quotas []RegionQuota
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		q := RegionQuota{}
+		if i := strings.LastIndex(part, ":"); i >= 0 {
+			q.Pattern = strings.TrimSpace(part[:i])
+			n, err := strconv.Atoi(strings.TrimSpace(part[i+1:]))
+			if err != nil || n < 0 {
+				return nil, fmt.Errorf("区域配额格式错误 %q，应为 \"区域名:数量\"，如 \"hongkong:20\"", part)
+			}
+			q.Count = n
+		} else {
+			q.Pattern = part
+		}
+		if q.Pattern == "" {
+			return nil, fmt.Errorf("区域名不能为空: %q", part)
+		}
+		quotas = append(quotas, q)
+	}
+	return quotas, nil
+}
+
+// tryParseDERPMap 尝试把输入解析为 derpMap（中间文件 derp-all.json 的格式）。
+// 成功返回 (map, true)；否则返回 (nil, false)，调用方可继续按 FOFA 资产解析。
+func tryParseDERPMap(data []byte) (*DERPMap, bool) {
+	var m DERPMap
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil, false
+	}
+	for _, r := range m.Regions {
+		if len(r.Nodes) > 0 {
+			return &m, true
+		}
+	}
+	return nil, false
+}
+
+// latencyMsOrMax 取节点的延迟毫秒数，缺失（0）时视为无穷大，排序时沉底。
+func latencyMsOrMax(n Node) int64 {
+	if n.LatencyMs <= 0 {
+		return int64(1) << 62
+	}
+	return n.LatencyMs
 }
