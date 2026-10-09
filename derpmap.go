@@ -58,7 +58,7 @@ func BuildCandidates(assets []Asset, start int) []Candidate {
 			// 无域名时填 IP 字面量，直连拨号仍走下面的 IPv4/IPv6（强制 IP，不走 DNS）。
 			HostName:         name,
 			DERPPort:         a.Port,
-			STUNPort:         -1, // 只验证了 TCP DERP，禁用未经验证的 UDP STUN（0 会被当作 3478）
+			STUNPort:         3478, // DERP 服务器默认在 UDP 3478 提供 STUN；探测时会真实验证 STUN 可用性，不可用则丢弃该节点
 			InsecureForTests: true,
 		}
 		if a.Domain == "" {

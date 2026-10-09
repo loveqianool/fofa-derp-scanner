@@ -9,12 +9,13 @@
 ## 特性
 
 - **真 DERP 协议探测**：TCP 建连 → TLS 握手 → HTTP Upgrade → DERP 握手 → 多次 ping 取中位 RTT，只有完整走通 DERP 协议的节点才会被保留（旧版只测 TLS 握手，会把大量"握手通但不中继"的节点误判为可用）
+- **STUN 必检**：探测时向 UDP 3478 发送 STUN Binding Request（对齐官方 derpprober），STUN 不通的节点直接丢弃——Tailscale 客户端靠 STUN 测量 DERP 延迟，STUN 不可用的中继会被客户端忽略（表现为无延迟、永不选用）。输出中 `STUNPort` 为 3478
+- **仅 TLS**：Tailscale 生产客户端只用 HTTPS 连接 DERP，因此只保留 TLS 握手成功的节点，明文 HTTP 节点会被丢弃
 - **可选的中继转发验证**（`--relay-test`）：在同一服务器上建立两个客户端，A 发包 B 收，验证服务器真正的客户端间转发能力，而不仅是 client↔server 的 ping
 - **一次跑完**：输入 FOFA 导出的 JSON，直接输出可粘贴进 Tailscale ACL 的 `derp.json`
 - **并发探测**：默认 50 并发，2600+ 节点几分钟扫完
 - **多格式兼容**：FOFA 网页导出的 JSON 数组 / JSON Lines / `{"results":[...]}` 包裹格式都能解析，按 `ip:port` 自动去重
 - **代理支持**：识别 `HTTPS_PROXY`/`HTTP_PROXY`（含 `NO_PROXY`），自动走 HTTP CONNECT 隧道
-- **80 端口降级**：端口实际是明文 HTTP 时自动降级为明文 Upgrade 探测
 
 ## 快速开始
 
@@ -58,6 +59,8 @@ Usage of derp-scan:
   -timeout duration    单节点探测总超时（默认 20s）
   -ping-timeout duration
                        单次 ping 超时（默认 5s）
+  -stun-timeout duration
+                       STUN UDP 探测超时（默认 5s，STUN 不通的节点会被丢弃，因 Tailscale 不会使用）
   -relay-test          额外验证客户端间中继转发（建两个客户端，A 发包 B 收），更严格（默认 false）
   -region string       筛选模式按区域配额选取，如 "guangzhou:20,hongkong:20"（省略 :数量 则取该区域全部），逗号分隔多个
   -version             打印版本并退出
@@ -180,6 +183,9 @@ A: 两个工具标准不同。derpprober 的 tls 探测会校验证书（自签�
 
 **Q: 扫出来可用节点太少？**
 A: 放宽 `--max-latency`（如 `200ms`）。扫描模式默认输出全部可用节点，不再截断。
+
+**Q: `tailscale debug derp` 报 `x509: certificate signed by unknown authority`，节点是不是坏了？**
+A: 不是。`debug derp` 的 TLS 配置没看 `InsecureForTests` 字段（源码 `ipn/localapi/debugderp.go` 的 `tlsConfigForNode`），自签名证书一定报错。真实客户端（`derphttp`）会遵循 `InsecureForTests: true` 跳过校验，节点可用。以 `tailscale status` 里是否出现延迟为准。
 
 **Q: 需要走代理？**
 A: 设置 `HTTPS_PROXY` 环境变量即可，`NO_PROXY` 也会被遵守。

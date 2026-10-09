@@ -12,9 +12,12 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"tailscale.com/net/stun/stuntest"
 )
 
 // fakeClient 表示假 DERP 服务器上的一个已连接客户端，写帧时加锁串行化。
@@ -152,7 +155,7 @@ func TestProbeDERP(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	rtt, err := ProbeDERP(ctx, host, port, 3, 5*time.Second, false)
+	rtt, err := ProbeDERP(ctx, host, port, 3, 5*time.Second, 0, false)
 	if err != nil {
 		t.Fatalf("探测失败: %v", err)
 	}
@@ -174,7 +177,7 @@ func TestProbeDERPNotDERP(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if _, err := ProbeDERP(ctx, host, port, 1, 3*time.Second, false); err == nil {
+	if _, err := ProbeDERP(ctx, host, port, 1, 3*time.Second, 0, false); err == nil {
 		t.Fatal("期望探测失败，但成功了")
 	}
 }
@@ -182,7 +185,7 @@ func TestProbeDERPNotDERP(t *testing.T) {
 func TestProbeDERPConnRefused(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if _, err := ProbeDERP(ctx, "127.0.0.1", 1, 1, 2*time.Second, false); err == nil {
+	if _, err := ProbeDERP(ctx, "127.0.0.1", 1, 1, 2*time.Second, 0, false); err == nil {
 		t.Fatal("期望连接被拒绝，但成功了")
 	}
 }
@@ -270,7 +273,7 @@ func TestProbeDERPWithRelay(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	rtt, err := ProbeDERP(ctx, host, port, 2, 5*time.Second, true)
+	rtt, err := ProbeDERP(ctx, host, port, 2, 5*time.Second, 0, true)
 	if err != nil {
 		t.Fatalf("探测失败: %v", err)
 	}
@@ -278,4 +281,36 @@ func TestProbeDERPWithRelay(t *testing.T) {
 		t.Fatalf("RTT 异常: %v", rtt)
 	}
 	t.Logf("RTT = %v（含中继验证）", rtt)
+}
+
+// TestProbeSTUN 验证 STUN 探测：用官方 stuntest 包起一个假 STUN 服务器。
+func TestProbeSTUN(t *testing.T) {
+	addr, cleanup := stuntest.Serve(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// stuntest 监听随机端口，probeSTUN 支持指定端口
+	if err := probeSTUN(ctx, addr.IP.String(), addr.Port); err != nil {
+		// 沙箱/CI 环境可能禁止 UDP，直接跳过而非失败
+		if strings.Contains(err.Error(), "operation not permitted") {
+			t.Skipf("环境禁止 UDP，跳过: %v", err)
+		}
+		t.Fatalf("probeSTUN 对假 STUN 服务器失败: %v", err)
+	}
+}
+
+// TestProbeSTUNRefused 验证向无 STUN 服务的地址探测会返回错误而非卡死。
+func TestProbeSTUNRefused(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	start := time.Now()
+	err := probeSTUN(ctx, "127.0.0.1", 3478) // 本机 3478 无服务
+	if err == nil {
+		t.Skip("本机 3478 意外有 STUN 响应，跳过")
+	}
+	if d := time.Since(start); d > 10*time.Second {
+		t.Errorf("STUN 探测卡死过久: %v", d)
+	}
+	t.Logf("STUN 失败如预期: %v", err)
 }

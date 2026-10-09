@@ -9,7 +9,7 @@ import (
 // TestBuildCandidatesNodeFields 锁定审计后的节点字段规则：
 //   - HostName 必须始终有值（derphttp 走代理拨号会拒绝空 HostName），无域名时填 IP
 //   - IPv6 地址必须进 IPv6 字段，不能塞进 IPv4（否则客户端静默忽略）
-//   - STUNPort 必须为 -1（只验证了 TCP DERP，禁用未经验证的 UDP STUN）
+//   - STUNPort 为 3478（DERP 服务器默认 STUN 端口；探测时会真实验证 STUN 可用性）
 func TestBuildCandidatesNodeFields(t *testing.T) {
 	assets := []Asset{
 		{IP: "1.1.1.1", Port: 443},
@@ -28,8 +28,8 @@ func TestBuildCandidatesNodeFields(t *testing.T) {
 	if n0.IPv4 != "1.1.1.1" {
 		t.Errorf("纯 IP 节点 IPv4 错误: %q", n0.IPv4)
 	}
-	if n0.STUNPort != -1 {
-		t.Errorf("STUNPort 应为 -1，实际 %d", n0.STUNPort)
+	if n0.STUNPort != 3478 {
+		t.Errorf("STUNPort 应为 3478，实际 %d", n0.STUNPort)
 	}
 
 	n1 := cands[1].Region.Nodes[0]
@@ -53,7 +53,7 @@ func TestBuildCandidatesNodeFields(t *testing.T) {
 }
 
 // TestDERPMapJSONFields 确认最终 JSON 里关键字段真实存在
-// （STUNPort: -1 不能被 omitempty 吃掉，HostName 不能缺席）。
+// （STUNPort: 3478 不能被 omitempty 吃掉，HostName 不能缺席）。
 func TestDERPMapJSONFields(t *testing.T) {
 	assets := []Asset{{IP: "1.1.1.1", Port: 443}}
 	cands := BuildCandidates(assets, 900)
@@ -64,7 +64,7 @@ func TestDERPMapJSONFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := string(out)
-	for _, want := range []string{`"HostName":"1.1.1.1"`, `"STUNPort":-1`, `"DERPPort":443`} {
+	for _, want := range []string{`"HostName":"1.1.1.1"`, `"STUNPort":3478`, `"DERPPort":443`} {
 		if !strings.Contains(s, want) {
 			t.Errorf("JSON 缺少 %s，实际: %s", want, s)
 		}

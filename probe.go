@@ -17,23 +17,35 @@ import (
 	"time"
 
 	"tailscale.com/derp"
+	"tailscale.com/net/stun"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 )
 
 // ProbeDERP 对单个 DERP 节点做真实 DERP 协议探测：
 // TCP 建连 -> TLS 握手(跳过证书校验) -> HTTP Upgrade 到 DERP ->
-// DERP 握手(ServerKey/ClientInfo) -> 发送 samples 次 ping 取中位 RTT。
+// DERP 握手(ServerKey/ClientInfo) -> 发送 samples 次 ping 取中位 RTT ->
+// UDP STUN 探测（Tailscale 客户端靠 STUN 测量延迟、决定是否使用该中继，不可用则丢弃）。
 // 任何一步失败都返回 error，调用方可视为节点不可用。
 // 若 TLS 握手发现对端是明文 HTTP（如 80 端口），自动降级为明文探测。
 // relayTest 为 true 时，额外验证服务器真正的客户端间中继转发
 // （建立两个客户端，A 发包、B 收包），比单纯 ping 更严格。
-func ProbeDERP(ctx context.Context, host string, port int, samples int, pingTimeout time.Duration, relayTest bool) (time.Duration, error) {
+// stunTimeout <= 0 时跳过 STUN 探测（仅测试用）。
+func ProbeDERP(ctx context.Context, host string, port int, samples int, pingTimeout, stunTimeout time.Duration, relayTest bool) (time.Duration, error) {
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
 
 	rtt, useTLS, err := probeOnceWithFallback(ctx, addr, samples, pingTimeout)
 	if err != nil {
 		return 0, err
+	}
+	// STUN 必须可用：Tailscale 客户端靠 UDP STUN 测量 DERP 延迟，
+	// STUN 不通的中继会被客户端直接忽略（表现为无延迟、永不选用）。
+	if stunTimeout > 0 {
+		stunCtx, cancel := context.WithTimeout(ctx, stunTimeout)
+		defer cancel()
+		if err := probeSTUN(stunCtx, host, 3478); err != nil {
+			return 0, err
+		}
 	}
 	if relayTest {
 		if err := probeRelay(ctx, addr, useTLS, pingTimeout); err != nil {
@@ -43,23 +55,67 @@ func ProbeDERP(ctx context.Context, host string, port int, samples int, pingTime
 	return rtt, nil
 }
 
+// probeSTUN 向 host:port 发送 STUN Binding Request 并等待响应，
+// 逻辑对齐官方 derpprober 的 derpProbeUDP。host 可为 IP 或域名，port 传 0 表示 3478。
+func probeSTUN(ctx context.Context, host string, port int) error {
+	if port == 0 {
+		port = 3478
+	}
+	ipStr := host
+	if net.ParseIP(host) == nil {
+		addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+		if err != nil || len(addrs) == 0 {
+			return fmt.Errorf("STUN 解析 %s 失败: %v", host, err)
+		}
+		ipStr = addrs[0].IP.String()
+	}
+	dst, err := net.ResolveUDPAddr("udp", net.JoinHostPort(ipStr, strconv.Itoa(port)))
+	if err != nil {
+		return fmt.Errorf("STUN 解析地址失败: %v", err)
+	}
+
+	pc, err := net.ListenPacket("udp", ":0")
+	if err != nil {
+		return fmt.Errorf("STUN 创建 UDP socket 失败: %v", err)
+	}
+	defer pc.Close()
+	uc, ok := pc.(*net.UDPConn)
+	if !ok {
+		return fmt.Errorf("STUN: 非预期 packet conn 类型")
+	}
+	// 用 ctx 的 deadline 做读写超时
+	if deadline, ok := ctx.Deadline(); ok {
+		uc.SetDeadline(deadline)
+	}
+
+	tx := stun.NewTxID()
+	req := stun.Request(tx)
+	if _, err := uc.WriteToUDP(req, dst); err != nil {
+		return fmt.Errorf("STUN 发送请求失败: %v", err)
+	}
+	buf := make([]byte, 1500)
+	n, _, err := uc.ReadFromUDP(buf)
+	if err != nil {
+		return fmt.Errorf("STUN 无响应: %v", shortErr(err))
+	}
+	txBack, _, err := stun.ParseResponse(buf[:n])
+	if err != nil {
+		return fmt.Errorf("STUN 解析响应失败: %v", err)
+	}
+	if txBack != tx {
+		return fmt.Errorf("STUN 事务 ID 不匹配")
+	}
+	return nil
+}
+
 // probeOnceWithFallback 先尝试 TLS 探测；若 TLS 握手发现对端是明文 HTTP，
 // 则降级为明文探测。返回 RTT 和最终使用的 useTLS。
 func probeOnceWithFallback(ctx context.Context, addr string, samples int, pingTimeout time.Duration) (time.Duration, bool, error) {
-	if rtt, err := probeOnce(ctx, addr, true, samples, pingTimeout); err == nil {
-		return rtt, true, nil
-	} else if !isPlaintextHint(err) {
-		return 0, false, err
-	}
-	// 对端不是 TLS，重新拨号做明文 HTTP Upgrade 探测
-	rtt, err := probeOnce(ctx, addr, false, samples, pingTimeout)
-	return rtt, false, err
-}
-
-// isPlaintextHint 判断 err 是否为"对端返回的不是 TLS 记录"——
-// 说明该端口跑的是明文 HTTP，应降级重试。
-func isPlaintextHint(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "first record does not look like a TLS handshake")
+	// 注意：Tailscale 生产客户端只用 HTTPS 连接 DERP（derphttp.urlString 硬编码 https，
+	// 仅 TS_DEBUG_USE_DERP_HTTP 调试环境变量可切换为 http），因此这里不做明文降级：
+	// TLS 握手失败的节点直接丢弃，否则输出的节点 Tailscale 根本连不上。
+	rtt, err := probeOnce(ctx, addr, true, samples, pingTimeout)
+	return rtt, true, err
 }
 
 func probeOnce(ctx context.Context, addr string, useTLS bool, samples int, pingTimeout time.Duration) (time.Duration, error) {

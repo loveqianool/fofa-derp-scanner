@@ -42,6 +42,7 @@ func run() int {
 		concurrency = flag.Int("concurrency", 50, "并发探测数")
 		timeout     = flag.Duration("timeout", 20*time.Second, "单个节点探测总超时")
 		pingTimeout = flag.Duration("ping-timeout", 5*time.Second, "单次 ping 超时")
+		stunTimeout = flag.Duration("stun-timeout", 5*time.Second, "STUN UDP 探测超时（STUN 不通的节点会被丢弃，因 Tailscale 不会使用）")
 		relayTest   = flag.Bool("relay-test", false, "额外验证客户端间中继转发（建两个客户端，A 发包 B 收），更严格")
 		region      = flag.String("region", "", "筛选模式按区域配额选取，如 \"guangzhou:20,hongkong:20\"（省略 :数量 则取该区域全部），逗号分隔多个")
 		showVersion = flag.Bool("version", false, "打印版本并退出")
@@ -74,7 +75,7 @@ func run() int {
 
 	// 复检模式：--check <derp-all.json>，重新探测并原地更新
 	if strings.TrimSpace(*check) != "" {
-		return runCheck(*check, *start, *maxLatency, *concurrency, *samples, *timeout, *pingTimeout, *relayTest)
+		return runCheck(*check, *start, *maxLatency, *concurrency, *samples, *timeout, *pingTimeout, *stunTimeout, *relayTest)
 	}
 
 	// 参数解析 fallback 链：命令行 flag → 环境变量 → 交互式输入。
@@ -122,7 +123,7 @@ func run() int {
 		fmt.Fprintf(os.Stderr, "解析 FOFA 数据失败: %v\n", err)
 		return 1
 	}
-	return runScan(assets, *start, outputPath, *maxLatency, *concurrency, *samples, *timeout, *pingTimeout, *relayTest)
+	return runScan(assets, *start, outputPath, *maxLatency, *concurrency, *samples, *timeout, *pingTimeout, *stunTimeout, *relayTest)
 }
 
 // probeJob 是一次探测任务。
@@ -140,7 +141,7 @@ type probeResult struct {
 
 // probeAll 并发探测一批目标，返回与 jobs 一一对应的结果。
 // 每个任务完成时实时打印进度；ctx 取消时直接返回已有结果。
-func probeAll(ctx context.Context, jobs []probeJob, concurrency, samples int, pingTimeout, timeout time.Duration, relayTest bool) []probeResult {
+func probeAll(ctx context.Context, jobs []probeJob, concurrency, samples int, pingTimeout, timeout, stunTimeout time.Duration, relayTest bool) []probeResult {
 	results := make([]probeResult, len(jobs))
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
@@ -159,7 +160,7 @@ func probeAll(ctx context.Context, jobs []probeJob, concurrency, samples int, pi
 
 			pctx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
-			rtt, err := ProbeDERP(pctx, jobs[i].host, jobs[i].port, samples, pingTimeout, relayTest)
+			rtt, err := ProbeDERP(pctx, jobs[i].host, jobs[i].port, samples, pingTimeout, stunTimeout, relayTest)
 
 			mu.Lock()
 			results[i] = probeResult{rtt: rtt, err: err}
@@ -177,7 +178,7 @@ func probeAll(ctx context.Context, jobs []probeJob, concurrency, samples int, pi
 }
 
 // runScan 扫描模式：探测 FOFA 资产中的全部节点，输出所有可用节点（按延迟排序，带 LatencyMs）。
-func runScan(assets []Asset, start int, outputPath string, maxLatency time.Duration, concurrency, samples int, timeout, pingTimeout time.Duration, relayTest bool) int {
+func runScan(assets []Asset, start int, outputPath string, maxLatency time.Duration, concurrency, samples int, timeout, pingTimeout, stunTimeout time.Duration, relayTest bool) int {
 	if len(assets) == 0 {
 		fmt.Fprintln(os.Stderr, "没有解析到有效节点（需要 ip + port）")
 		return 1
@@ -202,7 +203,7 @@ func runScan(assets []Asset, start int, outputPath string, maxLatency time.Durat
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	results := probeAll(ctx, jobs, concurrency, samples, pingTimeout, timeout, relayTest)
+	results := probeAll(ctx, jobs, concurrency, samples, pingTimeout, timeout, stunTimeout, relayTest)
 
 	if ctx.Err() != nil {
 		fmt.Fprintln(os.Stderr, "\n已取消，未写入输出文件。")
@@ -444,7 +445,7 @@ func nodeDialHost(n Node) string {
 
 // runCheck 复检模式：重新探测 derp-all.json 中的每个节点，剔除不可用/太慢的，
 // 更新延迟后按延迟重排、重新编号，原地写回。
-func runCheck(path string, start int, maxLatency time.Duration, concurrency, samples int, timeout, pingTimeout time.Duration, relayTest bool) int {
+func runCheck(path string, start int, maxLatency time.Duration, concurrency, samples int, timeout, pingTimeout, stunTimeout time.Duration, relayTest bool) int {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "读取文件失败: %v\n", err)
@@ -476,7 +477,7 @@ func runCheck(path string, start int, maxLatency time.Duration, concurrency, sam
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	results := probeAll(ctx, jobs, concurrency, samples, pingTimeout, timeout, relayTest)
+	results := probeAll(ctx, jobs, concurrency, samples, pingTimeout, timeout, stunTimeout, relayTest)
 
 	if ctx.Err() != nil {
 		fmt.Fprintln(os.Stderr, "\n已取消，未更新文件。")
