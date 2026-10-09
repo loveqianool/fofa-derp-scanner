@@ -33,6 +33,9 @@ type Node struct {
 	DERPPort         int    `json:"DERPPort"`
 	STUNPort         int    `json:"STUNPort,omitempty"`
 	InsecureForTests bool   `json:"InsecureForTests"`
+	// CanPort80 固定为 false（omitempty 省略）：第三方 DERP 不开放 80，
+	// 客户端只用 443 中继 + STUN，避免反复尝试 80 做 captive portal 检测而超时。
+	CanPort80 bool `json:",omitempty"`
 	// LatencyMs 是探测到的中位延迟（毫秒），只用于 derp-all.json 这类中间文件，
 	// 方便二次筛选时按延迟排序。最终粘贴到 ACL 的输出会去掉该字段（omitempty）。
 	LatencyMs int64 `json:"LatencyMs,omitempty"`
