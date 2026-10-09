@@ -61,14 +61,14 @@ func BuildCandidates(assets []Asset, start int) []Candidate {
 			STUNPort:         3478, // DERP 服务器默认在 UDP 3478 提供 STUN；探测时会真实验证 STUN 可用性，不可用则丢弃该节点
 			InsecureForTests: true,
 		}
-		if a.Domain == "" {
-			// 无域名：按地址类型填入对应字段，避免 IPv6 被误塞进 IPv4 导致客户端忽略
-			if ip := net.ParseIP(a.IP); ip != nil {
-				if ip.To4() != nil {
-					node.IPv4 = a.IP
-				} else {
-					node.IPv6 = a.IP
-				}
+		// 只要 FOFA 给了 IP，就按地址类型填入对应字段（双栈写入）：
+		// 客户端优先用 IPv4/IPv6 直连（免 DNS），TLS SNI 仍用 HostName（域名或 IP）；
+		// 避免 IPv6 被误塞进 IPv4 导致客户端忽略。
+		if ip := net.ParseIP(a.IP); ip != nil {
+			if ip.To4() != nil {
+				node.IPv4 = a.IP
+			} else {
+				node.IPv6 = a.IP
 			}
 		}
 		cands = append(cands, Candidate{

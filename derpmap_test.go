@@ -36,8 +36,9 @@ func TestBuildCandidatesNodeFields(t *testing.T) {
 	if n1.HostName != "a.com" {
 		t.Errorf("域名节点 HostName 错误: %q", n1.HostName)
 	}
-	if n1.IPv4 != "" || n1.IPv6 != "" {
-		t.Errorf("域名节点不应填 IP 字段: %+v", n1)
+	// 域名节点也要写 IPv4/IPv6（双栈写入）：客户端直连用 IP，SNI 用域名
+	if n1.IPv4 != "2.2.2.2" {
+		t.Errorf("域名节点 IPv4 应为 2.2.2.2，实际 %q", n1.IPv4)
 	}
 
 	n2 := cands[2].Region.Nodes[0]
