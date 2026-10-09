@@ -220,6 +220,8 @@ func runScan(assets []Asset, start int, outputPath string, maxLatency time.Durat
 		default:
 			c := cands[i]
 			c.RTT = r.rtt
+			// CanPort80 固定 false：第三方 DERP 不开放 80，客户端只用 443+STUN，
+			// 避免反复尝试 80 超时。omitempty 会省略该字段，效果等同于 false。
 			ok = append(ok, c)
 		}
 	}
@@ -498,6 +500,7 @@ func runCheck(path string, start int, maxLatency time.Duration, concurrency, sam
 		default:
 			n := all[i].node
 			n.LatencyMs = r.rtt.Milliseconds()
+			n.CanPort80 = false
 			okList = append(okList, okItem{flatNode: flatNode{regionName: all[i].regionName, node: n}, rtt: r.rtt})
 		}
 	}
