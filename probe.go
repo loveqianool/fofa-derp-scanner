@@ -57,18 +57,45 @@ func ProbeDERP(ctx context.Context, host string, port int, samples int, pingTime
 
 // probeSTUN 向 host:port 发送 STUN Binding Request 并等待响应，
 // 逻辑对齐官方 derpprober 的 derpProbeUDP。host 可为 IP 或域名，port 传 0 表示 3478。
+// 域名解析出多个 IP（v4/v6）时逐个尝试，任一成功即返回 nil。
 func probeSTUN(ctx context.Context, host string, port int) error {
 	if port == 0 {
 		port = 3478
 	}
-	ipStr := host
-	if net.ParseIP(host) == nil {
+	var ipStrs []string
+	if ip := net.ParseIP(host); ip != nil {
+		ipStrs = []string{ip.String()}
+	} else {
 		addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 		if err != nil || len(addrs) == 0 {
 			return fmt.Errorf("STUN 解析 %s 失败: %v", host, err)
 		}
-		ipStr = addrs[0].IP.String()
+		seen := make(map[string]bool)
+		for _, a := range addrs {
+			s := a.IP.String()
+			if !seen[s] {
+				seen[s] = true
+				ipStrs = append(ipStrs, s)
+			}
+		}
 	}
+
+	var lastErr error
+	for _, ipStr := range ipStrs {
+		if err := probeSTUNOne(ctx, ipStr, port); err != nil {
+			lastErr = err
+			continue
+		}
+		return nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("无可用 IP")
+	}
+	return fmt.Errorf("STUN 无响应: %v", shortErr(lastErr))
+}
+
+// probeSTUNOne 对单个 IP 的 UDP 端口做一次 STUN Binding Request/Response。
+func probeSTUNOne(ctx context.Context, ipStr string, port int) error {
 	dst, err := net.ResolveUDPAddr("udp", net.JoinHostPort(ipStr, strconv.Itoa(port)))
 	if err != nil {
 		return fmt.Errorf("STUN 解析地址失败: %v", err)

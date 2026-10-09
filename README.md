@@ -9,7 +9,7 @@
 ## 特性
 
 - **真 DERP 协议探测**：TCP 建连 → TLS 握手 → HTTP Upgrade → DERP 握手 → 多次 ping 取中位 RTT，只有完整走通 DERP 协议的节点才会被保留（旧版只测 TLS 握手，会把大量"握手通但不中继"的节点误判为可用）
-- **STUN 必检**：探测时向 UDP 3478 发送 STUN Binding Request（对齐官方 derpprober），STUN 不通的节点直接丢弃——Tailscale 客户端靠 STUN 测量 DERP 延迟，STUN 不可用的中继会被客户端忽略（表现为无延迟、永不选用）。输出中 `STUNPort` 为 3478
+- **STUN 必检**：探测时向 UDP 3478 发送 STUN Binding Request（对齐官方 derpprober，支持 IPv4/IPv6 双栈，域名解析出多 IP 时逐个尝试），STUN 不通的节点直接丢弃——Tailscale 客户端靠 STUN 测量 DERP 延迟，STUN 不可用的中继会被客户端忽略（表现为无延迟、永不选用）。输出中 `STUNPort` 为 3478
 - **仅 TLS**：Tailscale 生产客户端只用 HTTPS 连接 DERP，因此只保留 TLS 握手成功的节点，明文 HTTP 节点会被丢弃
 - **可选的中继转发验证**（`--relay-test`）：在同一服务器上建立两个客户端，A 发包 B 收，验证服务器真正的客户端间转发能力，而不仅是 client↔server 的 ping
 - **一次跑完**：输入 FOFA 导出的 JSON，直接输出可粘贴进 Tailscale ACL 的 `derp.json`
