@@ -419,3 +419,76 @@ type bufferedConn struct {
 }
 
 func (c *bufferedConn) Read(b []byte) (int, error) { return c.r.Read(b) }
+
+// probeBandwidth 测量经 DERP 中继的实际转发带宽：在同一服务器建立两个
+// 客户端 A 和 B，A 向 B 发送 totalBytes 数据（分片 pipeline 发送），
+// B 统计实际接收字节数与耗时。返回 (接收字节数, 耗时, 错误)。
+// 超时时按实际接收量返回（不视为错误，调用方标记 timed_out）。
+func probeBandwidth(ctx context.Context, addr string, totalBytes int64, timeout time.Duration) (int64, time.Duration, error) {
+	keyA := key.NewNode()
+	keyB := key.NewNode()
+
+	connA, dcA, err := dialDERP(ctx, addr, keyA, timeout)
+	if err != nil {
+		return 0, 0, fmt.Errorf("客户端 A 建连: %w", err)
+	}
+	defer connA.Close()
+	connB, dcB, err := dialDERP(ctx, addr, keyB, timeout)
+	if err != nil {
+		return 0, 0, fmt.Errorf("客户端 B 建连: %w", err)
+	}
+	defer connB.Close()
+
+	// B 先 ping 一次：证明 B 已被服务器接纳（enrollment 完成），
+	// 否则 A 的包可能因 B 尚未注册而被丢弃。
+	if _, err := pingOnce(ctx, dcB, connB, timeout); err != nil {
+		return 0, 0, fmt.Errorf("客户端 B 自检: %w", err)
+	}
+
+	const chunkSize = 32 << 10 // 32KB，小于 DERP MaxPacketSize(64KB)
+	payload := make([]byte, chunkSize)
+	if _, err := rand.Read(payload); err != nil {
+		return 0, 0, err
+	}
+
+	bctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	// B 接收协程：收到 totalBytes 或出错/超时即退出
+	done := make(chan struct{})
+	var recvBytes int64
+	go func() {
+		defer close(done)
+		for recvBytes < totalBytes {
+			m, e := recvWithTimeout(bctx, dcB, connB, timeout)
+			if e != nil {
+				return
+			}
+			if rp, ok := m.(derp.ReceivedPacket); ok && rp.Source == keyA.Public() {
+				recvBytes += int64(len(rp.Data))
+			}
+		}
+	}()
+
+	// A 发送：pipeline 连发，TCP 背压自然限速
+	connA.SetDeadline(time.Now().Add(timeout))
+	start := time.Now()
+	var sent int64
+	for sent < totalBytes {
+		if bctx.Err() != nil {
+			break
+		}
+		n := chunkSize
+		if r := totalBytes - sent; r < int64(n) {
+			n = int(r)
+		}
+		if e := dcA.Send(keyB.Public(), payload[:n]); e != nil {
+			break
+		}
+		sent += int64(n)
+	}
+
+	<-done // 等 B 结束（收完或超时；超时由 recvWithTimeout 的 conn 关闭保证退出）
+	elapsed := time.Since(start)
+	return recvBytes, elapsed, nil
+}

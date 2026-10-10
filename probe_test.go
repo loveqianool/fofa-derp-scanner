@@ -314,3 +314,25 @@ func TestProbeSTUNRefused(t *testing.T) {
 	}
 	t.Logf("STUN 失败如预期: %v", err)
 }
+
+// TestProbeBandwidth 用假 DERP 服务器验证带宽测试能跑通并返回合理值。
+// 假服务器本机回环，带宽会虚高，重点验证流程正确（不断言具体数值）。
+func TestProbeBandwidth(t *testing.T) {
+	host, port := startFakeDERP(t, 0, true)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
+	n, elapsed, err := probeBandwidth(ctx, addr, 1<<20, 20*time.Second) // 1MB
+	if err != nil {
+		t.Fatalf("probeBandwidth 失败: %v", err)
+	}
+	if n != 1<<20 {
+		t.Errorf("接收字节数 = %d, want %d", n, 1<<20)
+	}
+	if elapsed <= 0 {
+		t.Error("耗时应 > 0")
+	}
+	mbps := float64(n) * 8 / elapsed.Seconds() / 1e6
+	t.Logf("1MB 耗时 %v, 折算 %.1f Mbps", elapsed.Round(time.Millisecond), mbps)
+}

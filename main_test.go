@@ -101,3 +101,32 @@ func TestApplyQuotas(t *testing.T) {
 		t.Fatalf("不限量应取 3 个广州节点，got %d,%v", len(sel), err)
 	}
 }
+
+// TestParseSize 验证带宽数据量解析。
+func TestParseSize(t *testing.T) {
+	for in, want := range map[string]int64{
+		"10MB": 10 << 20, "512KB": 512 << 10, "1GB": 1 << 30,
+		"1.5MB": int64(1.5 * (1 << 20)), "1048576": 1048576,
+		"10mb": 10 << 20, " 5M ": 5 << 20,
+	} {
+		got, err := parseSize(in)
+		if err != nil || got != want {
+			t.Errorf("parseSize(%q) = %d, %v; want %d", in, got, err, want)
+		}
+	}
+	for _, bad := range []string{"", "abc", "0MB", "-5MB", "10XB"} {
+		if _, err := parseSize(bad); err == nil {
+			t.Errorf("parseSize(%q) 应报错", bad)
+		}
+	}
+}
+
+// TestFormatSize 验证字节数格式化。
+func TestFormatSize(t *testing.T) {
+	if got := formatSize(10 << 20); got != "10MB" {
+		t.Errorf("formatSize(10MB) = %q", got)
+	}
+	if got := formatSize(1536); got != "1536B" {
+		t.Errorf("formatSize(1536) = %q", got)
+	}
+}

@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -45,6 +47,11 @@ func run() int {
 		stunTimeout = flag.Duration("stun-timeout", 5*time.Second, "STUN UDP 探测超时（STUN 不通的节点会被丢弃，因 Tailscale 不会使用）")
 		relayTest   = flag.Bool("relay-test", false, "额外验证客户端间中继转发（建两个客户端，A 发包 B 收），更严格")
 		region      = flag.String("region", "", "筛选模式按区域配额选取，如 \"guangzhou:20,hongkong:20\"（省略 :数量 则取该区域全部），逗号分隔多个")
+		bandwidth   = flag.String("bandwidth", "", "带宽模式：对指定 derpMap JSON（如 derp.json）中的节点做中继带宽测试，输出带宽报告")
+		bwSize      = flag.String("bw-size", "10MB", "带宽测试每节点发送的数据量，如 \"10MB\"、\"512KB\"、\"1GB\"")
+		bwConcurrency = flag.Int("bw-concurrency", 5, "带宽测试并发数（带宽测试吃流量，并发太高会互相干扰）")
+		bwTimeout   = flag.Duration("bw-timeout", 30*time.Second, "带宽测试单节点超时（超时按实际接收量折算带宽）")
+		bwOutput    = flag.String("bw-output", "bandwidth.json", "带宽报告输出路径")
 		showVersion = flag.Bool("version", false, "打印版本并退出")
 	)
 	flag.Parse()
@@ -71,6 +78,24 @@ func run() int {
 	if *start < 900 || *start > 999 {
 		fmt.Fprintln(os.Stderr, "错误: --start 必须在 900-999 范围内（官方托管自定义区域 ID 范围）")
 		return 2
+	}
+
+	// 带宽模式：--bandwidth <derp.json>，测试成品的中继带宽并输出报告
+	if strings.TrimSpace(*bandwidth) != "" {
+		totalBytes, err := parseSize(*bwSize)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+			return 2
+		}
+		if *bwConcurrency < 1 {
+			fmt.Fprintln(os.Stderr, "错误: --bw-concurrency 必须 >= 1")
+			return 2
+		}
+		if *bwTimeout <= 0 {
+			fmt.Fprintln(os.Stderr, "错误: --bw-timeout 必须 > 0")
+			return 2
+		}
+		return runBandwidth(*bandwidth, totalBytes, *bwConcurrency, *bwTimeout, *bwOutput)
 	}
 
 	// 复检模式：--check <derp-all.json>，重新探测并原地更新
@@ -544,6 +569,218 @@ func runCheck(path string, start int, maxLatency time.Duration, concurrency, sam
 
 	fmt.Printf("\n复检完成：%d/%d 个节点可用，已按延迟重排并原地更新 %s\n", len(okList), len(all), path)
 	return 0
+}
+
+// bwResult 是单个节点的带宽测试结果。
+type bwResult struct {
+	flatNode
+	mbps     float64
+	bytes    int64
+	elapsed  time.Duration
+	timedOut bool
+	err      error
+}
+
+// parseSize 解析数据量字符串，如 "10MB"、"512KB"、"1GB"、"1048576"（纯数字视为字节）。
+func parseSize(s string) (int64, error) {
+	t := strings.TrimSpace(strings.ToUpper(s))
+	mul := int64(1)
+	// 长后缀优先匹配，避免 "10MB" 被 "M" 截断
+	for _, suf := range []struct {
+		s string
+		m int64
+	}{{"GB", 1 << 30}, {"MB", 1 << 20}, {"KB", 1 << 10}, {"G", 1 << 30}, {"M", 1 << 20}, {"K", 1 << 10}, {"B", 1}} {
+		if strings.HasSuffix(t, suf.s) {
+			mul = suf.m
+			t = strings.TrimSpace(strings.TrimSuffix(t, suf.s))
+			break
+		}
+	}
+	f, err := strconv.ParseFloat(t, 64)
+	if err != nil || f <= 0 {
+		return 0, fmt.Errorf("数据量格式错误 %q，应如 \"10MB\"、\"512KB\"、\"1GB\"", s)
+	}
+	return int64(f * float64(mul)), nil
+}
+
+// runBandwidth 带宽模式：对 derpMap 文件中的每个节点做 A→B 中继带宽测试，
+// 按带宽降序输出报告到控制台并写入 bandwidth.json（不修改输入文件）。
+func runBandwidth(path string, totalBytes int64, concurrency int, timeout time.Duration, outputPath string) int {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "读取文件失败: %v\n", err)
+		return 1
+	}
+	dm, ok := tryParseDERPMap(data)
+	if !ok {
+		fmt.Fprintln(os.Stderr, "错误: --bandwidth 需要输入 derpMap 格式的 JSON（如 derp.json 或 derp-all.json）。")
+		return 2
+	}
+	all := flattenDERPMap(dm)
+	if len(all) == 0 {
+		fmt.Fprintln(os.Stderr, "文件中没有节点，无需测试。")
+		return 1
+	}
+
+	jobs := make([]probeJob, len(all))
+	for i, f := range all {
+		host := nodeDialHost(f.node)
+		jobs[i] = probeJob{label: fmt.Sprintf("%s:%d", host, f.node.DERPPort), host: host, port: f.node.DERPPort}
+	}
+
+	fmt.Printf("带宽测试 %s 中的 %d 个节点（每节点 %s，超时 %v，并发 %d）…\n",
+		path, len(all), formatSize(totalBytes), timeout, concurrency)
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	results := make([]bwResult, len(all))
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	done := 0
+	for i := range jobs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				mu.Lock()
+				results[i] = bwResult{flatNode: all[i], err: ctx.Err()}
+				mu.Unlock()
+				return
+			}
+			defer func() { <-sem }()
+
+			addr := net.JoinHostPort(jobs[i].host, strconv.Itoa(jobs[i].port))
+			n, elapsed, err := probeBandwidth(ctx, addr, totalBytes, timeout)
+
+			mu.Lock()
+			r := bwResult{flatNode: all[i], bytes: n, elapsed: elapsed, err: err}
+			if err == nil {
+				if n < totalBytes {
+					r.timedOut = true
+				}
+				if elapsed > 0 {
+					r.mbps = float64(n) * 8 / elapsed.Seconds() / 1e6
+				}
+			}
+			results[i] = r
+			done++
+			if err != nil {
+				fmt.Printf("[%d/%d] %-30s 失败: %v\n", done, len(jobs), jobs[i].label, shortErr(err))
+			} else {
+				flag := ""
+				if r.timedOut {
+					flag = "（超时，按实际折算）"
+				}
+				fmt.Printf("[%d/%d] %-30s %.1f Mbps%s\n", done, len(jobs), jobs[i].label, r.mbps, flag)
+			}
+			mu.Unlock()
+		}(i)
+	}
+	wg.Wait()
+
+	if ctx.Err() != nil {
+		fmt.Fprintln(os.Stderr, "\n已取消，未写入输出文件。")
+		return 1
+	}
+
+	// 按带宽降序，失败的沉底
+	sort.Slice(results, func(i, j int) bool {
+		if (results[i].err != nil) != (results[j].err != nil) {
+			return results[j].err != nil
+		}
+		return results[i].mbps > results[j].mbps
+	})
+
+	// 控制台表格
+	fmt.Printf("\n%-8s %-30s %10s %10s\n", "排名", "节点", "带宽", "耗时")
+	for i, r := range results {
+		if r.err != nil {
+			fmt.Printf("%-8d %-30s %10s %10s\n", i+1, r.node.HostName, "失败", "-")
+			continue
+		}
+		to := ""
+		if r.timedOut {
+			to = "*"
+		}
+		fmt.Printf("%-8d %-30s %9.1f%s %9s\n", i+1, r.node.HostName, r.mbps, to, r.elapsed.Round(time.Millisecond))
+	}
+	fmt.Println("(* 超时，按实际接收量折算)")
+
+	// 写 bandwidth.json
+	type bwEntry struct {
+		Name      string  `json:"name"`
+		RegionID  int     `json:"region_id"`
+		Region    string  `json:"region"`
+		Host      string  `json:"host"`
+		Port      int     `json:"port"`
+		Mbps      float64 `json:"mbps"`
+		Bytes     int64   `json:"bytes"`
+		ElapsedMs int64   `json:"elapsed_ms"`
+		TimedOut  bool    `json:"timed_out"`
+		Error     string  `json:"error,omitempty"`
+	}
+	type bwReport struct {
+		TestedAt string `json:"tested_at"`
+		Config   struct {
+			Size       string `json:"size"`
+			Bytes      int64  `json:"bytes"`
+			Timeout    string `json:"timeout"`
+			Concurrency int   `json:"concurrency"`
+		} `json:"config"`
+		Results []bwEntry `json:"results"`
+	}
+	rep := bwReport{TestedAt: time.Now().Format(time.RFC3339)}
+	rep.Config.Size = formatSize(totalBytes)
+	rep.Config.Bytes = totalBytes
+	rep.Config.Timeout = timeout.String()
+	rep.Config.Concurrency = concurrency
+	for _, r := range results {
+		e := bwEntry{
+			Name:      r.node.Name,
+			RegionID:  r.node.RegionID,
+			Region:    r.regionName,
+			Host:      r.node.HostName,
+			Port:      r.node.DERPPort,
+			Mbps:      math.Round(r.mbps*10) / 10,
+			Bytes:     r.bytes,
+			ElapsedMs: r.elapsed.Milliseconds(),
+			TimedOut:  r.timedOut,
+		}
+		if r.err != nil {
+			e.Error = shortErr(r.err)
+		}
+		rep.Results = append(rep.Results, e)
+	}
+	out, err := json.MarshalIndent(rep, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "生成 JSON 失败: %v\n", err)
+		return 1
+	}
+	out = append(out, '\n')
+	if err := writeFileAtomic(outputPath, out); err != nil {
+		fmt.Fprintf(os.Stderr, "写入输出文件失败: %v\n", err)
+		return 1
+	}
+	fmt.Printf("\n带宽报告已写入 %s\n", outputPath)
+	return 0
+}
+
+// formatSize 把字节数格式化为人类可读，如 10485760 -> "10MB"。
+func formatSize(n int64) string {
+	switch {
+	case n >= 1<<30 && n%(1<<30) == 0:
+		return fmt.Sprintf("%dGB", n>>30)
+	case n >= 1<<20 && n%(1<<20) == 0:
+		return fmt.Sprintf("%dMB", n>>20)
+	case n >= 1<<10 && n%(1<<10) == 0:
+		return fmt.Sprintf("%dKB", n>>10)
+	default:
+		return fmt.Sprintf("%dB", n)
+	}
 }
 
 // writeFileAtomic 原子写入文件：先写同目录临时文件再 rename，

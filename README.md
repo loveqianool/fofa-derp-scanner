@@ -100,6 +100,23 @@ Usage of derp-scan:
 
 重新探测每个节点，剔除不可用/超时的，更新延迟后重排并原地写回。全部不可用时不会清空文件。
 
+### 4. 带宽测试：对成品 derp.json 测中继带宽（输出 bandwidth.json）
+
+```bash
+./derp-scan --bandwidth derp.json
+```
+
+每个节点建两个客户端 A/B，A 经服务器中继给 B 发数据，测实际转发带宽（不是裸 TCP 测速）。按带宽降序打印表格并写入 `bandwidth.json`，不修改输入文件。参数都可配：
+
+```bash
+./derp-scan --bandwidth derp.json --bw-size 50MB --bw-concurrency 3 --bw-timeout 60s --bw-output bw.json
+```
+
+- `--bw-size`：每节点发送的数据量（默认 `10MB`，支持 KB/MB/GB）
+- `--bw-concurrency`：并发数（默认 5，带宽测试吃流量，并发太高会互相干扰）
+- `--bw-timeout`：单节点超时（默认 30s，超时按实际接收量折算带宽并标记，不直接判失败）
+- `--bw-output`：报告输出路径（默认 `bandwidth.json`）
+
 输出示例（扫描模式）：
 
 ```
