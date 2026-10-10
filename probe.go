@@ -34,7 +34,10 @@ import (
 func ProbeDERP(ctx context.Context, host string, port int, samples int, pingTimeout, stunTimeout time.Duration, relayTest bool) (time.Duration, error) {
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
 
-	rtt, useTLS, err := probeOnceWithFallback(ctx, addr, samples, pingTimeout)
+	// 注意：Tailscale 生产客户端只用 HTTPS 连接 DERP（derphttp.urlString 硬编码 https，
+	// 仅 TS_DEBUG_USE_DERP_HTTP 调试环境变量可切换为 http），因此不做明文降级：
+	// TLS 握手失败的节点直接丢弃，否则输出的节点 Tailscale 根本连不上。
+	rtt, err := probeOnce(ctx, addr, samples, pingTimeout)
 	if err != nil {
 		return 0, err
 	}
@@ -48,7 +51,7 @@ func ProbeDERP(ctx context.Context, host string, port int, samples int, pingTime
 		}
 	}
 	if relayTest {
-		if err := probeRelay(ctx, addr, useTLS, pingTimeout); err != nil {
+		if err := probeRelay(ctx, addr, pingTimeout); err != nil {
 			return 0, err
 		}
 	}
@@ -135,18 +138,8 @@ func probeSTUNOne(ctx context.Context, ipStr string, port int) error {
 	return nil
 }
 
-// probeOnceWithFallback 先尝试 TLS 探测；若 TLS 握手发现对端是明文 HTTP，
-// 则降级为明文探测。返回 RTT 和最终使用的 useTLS。
-func probeOnceWithFallback(ctx context.Context, addr string, samples int, pingTimeout time.Duration) (time.Duration, bool, error) {
-	// 注意：Tailscale 生产客户端只用 HTTPS 连接 DERP（derphttp.urlString 硬编码 https，
-	// 仅 TS_DEBUG_USE_DERP_HTTP 调试环境变量可切换为 http），因此这里不做明文降级：
-	// TLS 握手失败的节点直接丢弃，否则输出的节点 Tailscale 根本连不上。
-	rtt, err := probeOnce(ctx, addr, true, samples, pingTimeout)
-	return rtt, true, err
-}
-
-func probeOnce(ctx context.Context, addr string, useTLS bool, samples int, pingTimeout time.Duration) (time.Duration, error) {
-	conn, dc, err := dialDERP(ctx, addr, useTLS, key.NewNode(), pingTimeout)
+func probeOnce(ctx context.Context, addr string, samples int, pingTimeout time.Duration) (time.Duration, error) {
+	conn, dc, err := dialDERP(ctx, addr, key.NewNode(), pingTimeout)
 	if err != nil {
 		return 0, err
 	}
@@ -226,16 +219,16 @@ func recvWithTimeout(ctx context.Context, dc *derp.Client, conn net.Conn, timeou
 // 两个 DERP 客户端 A 和 B，A 发包给 B，B 必须能收到。
 // 这比 ping 更进一步——ping 只证明 client<->server 通，
 // 这里验证的才是中继的实际用法：server 在两个 client 之间转发。
-func probeRelay(ctx context.Context, addr string, useTLS bool, timeout time.Duration) error {
+func probeRelay(ctx context.Context, addr string, timeout time.Duration) error {
 	keyA := key.NewNode()
 	keyB := key.NewNode()
 
-	connA, dcA, err := dialDERP(ctx, addr, useTLS, keyA, timeout)
+	connA, dcA, err := dialDERP(ctx, addr, keyA, timeout)
 	if err != nil {
 		return fmt.Errorf("客户端 A 建连: %w", err)
 	}
 	defer connA.Close()
-	connB, dcB, err := dialDERP(ctx, addr, useTLS, keyB, timeout)
+	connB, dcB, err := dialDERP(ctx, addr, keyB, timeout)
 	if err != nil {
 		return fmt.Errorf("客户端 B 建连: %w", err)
 	}
@@ -269,10 +262,10 @@ func probeRelay(ctx context.Context, addr string, useTLS bool, timeout time.Dura
 	}
 }
 
-// dialDERP 完成到 addr 的 TCP 建连、TLS 握手（可选）、HTTP Upgrade 到 DERP
+// dialDERP 完成到 addr 的 TCP 建连、TLS 握手、HTTP Upgrade 到 DERP
 // 以及 DERP 握手（ServerKey/ClientInfo），返回顶层连接和 client。
 // 调用方负责 Close(conn)。timeout 用于握手阶段的整体 deadline。
-func dialDERP(ctx context.Context, addr string, useTLS bool, privKey key.NodePrivate, timeout time.Duration) (net.Conn, *derp.Client, error) {
+func dialDERP(ctx context.Context, addr string, privKey key.NodePrivate, timeout time.Duration) (net.Conn, *derp.Client, error) {
 	rawConn, err := dialTarget(ctx, addr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("tcp: %w", err)
@@ -287,29 +280,25 @@ func dialDERP(ctx context.Context, addr string, useTLS bool, privKey key.NodePri
 	}()
 
 	var conn net.Conn = rawConn
-	scheme := "http"
-	if useTLS {
-		tlsConf := &tls.Config{
-			InsecureSkipVerify: true,
-			// 带上 ALPN（像浏览器/curl 一样）：某些出口网关会优待带 ALPN 的 ClientHello，
-			// 对标准 DERP 服务端无影响（不支持则直接忽略）。
-			NextProtos: []string{"http/1.1"},
-		}
-		if host, _, _ := net.SplitHostPort(addr); net.ParseIP(host) == nil {
-			tlsConf.ServerName = host // 域名节点带上 SNI
-		}
-		tlsConn := tls.Client(rawConn, tlsConf)
-		if err := tlsConn.HandshakeContext(ctx); err != nil {
-			return nil, nil, fmt.Errorf("tls: %w", err)
-		}
-		conn = tlsConn
-		scheme = "https"
+	tlsConf := &tls.Config{
+		InsecureSkipVerify: true,
+		// 带上 ALPN（像浏览器/curl 一样）：某些出口网关会优待带 ALPN 的 ClientHello，
+		// 对标准 DERP 服务端无影响（不支持则直接忽略）。
+		NextProtos: []string{"http/1.1"},
 	}
+	if host, _, _ := net.SplitHostPort(addr); net.ParseIP(host) == nil {
+		tlsConf.ServerName = host // 域名节点带上 SNI
+	}
+	tlsConn := tls.Client(rawConn, tlsConf)
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		return nil, nil, fmt.Errorf("tls: %w", err)
+	}
+	conn = tlsConn
 
 	// HTTP Upgrade 切换到 DERP 协议
 	br := bufio.NewReader(conn)
 	bw := bufio.NewWriter(conn)
-	req, err := http.NewRequest("GET", scheme+"://"+addr+"/derp", nil)
+	req, err := http.NewRequest("GET", "https://"+addr+"/derp", nil)
 	if err != nil {
 		return nil, nil, err
 	}
