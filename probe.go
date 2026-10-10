@@ -420,35 +420,59 @@ type bufferedConn struct {
 
 func (c *bufferedConn) Read(b []byte) (int, error) { return c.r.Read(b) }
 
+// bwStatus 是带宽测试的结束状态。
+type bwStatus string
+
+const (
+	bwComplete     bwStatus = "completed"    // 跑完指定数据量
+	bwTimeout      bwStatus = "timeout"      // 超时未跑完
+	bwDisconnected bwStatus = "disconnected" // 连接中途断开
+)
+
+// bwStatusText 把状态翻译成中文。
+func bwStatusText(s bwStatus) string {
+	switch s {
+	case bwComplete:
+		return "完成"
+	case bwTimeout:
+		return "超时"
+	case bwDisconnected:
+		return "中断"
+	default:
+		return string(s)
+	}
+}
+
 // probeBandwidth 测量经 DERP 中继的实际转发带宽：在同一服务器建立两个
 // 客户端 A 和 B，A 向 B 发送 totalBytes 数据（分片 pipeline 发送），
-// B 统计实际接收字节数与耗时。返回 (接收字节数, 耗时, 错误)。
-// 超时时按实际接收量返回（不视为错误，调用方标记 timed_out）。
-func probeBandwidth(ctx context.Context, addr string, totalBytes int64, timeout time.Duration) (int64, time.Duration, error) {
+// B 统计实际接收字节数与耗时。返回 (接收字节数, 耗时, 状态, 错误)。
+// 未跑完时状态为 timeout（超时）或 disconnected（连接中断），
+// 此时按实际接收量折算带宽。
+func probeBandwidth(ctx context.Context, addr string, totalBytes int64, timeout time.Duration) (int64, time.Duration, bwStatus, error) {
 	keyA := key.NewNode()
 	keyB := key.NewNode()
 
 	connA, dcA, err := dialDERP(ctx, addr, keyA, timeout)
 	if err != nil {
-		return 0, 0, fmt.Errorf("客户端 A 建连: %w", err)
+		return 0, 0, bwDisconnected, fmt.Errorf("客户端 A 建连: %w", err)
 	}
 	defer connA.Close()
 	connB, dcB, err := dialDERP(ctx, addr, keyB, timeout)
 	if err != nil {
-		return 0, 0, fmt.Errorf("客户端 B 建连: %w", err)
+		return 0, 0, bwDisconnected, fmt.Errorf("客户端 B 建连: %w", err)
 	}
 	defer connB.Close()
 
 	// B 先 ping 一次：证明 B 已被服务器接纳（enrollment 完成），
 	// 否则 A 的包可能因 B 尚未注册而被丢弃。
 	if _, err := pingOnce(ctx, dcB, connB, timeout); err != nil {
-		return 0, 0, fmt.Errorf("客户端 B 自检: %w", err)
+		return 0, 0, bwDisconnected, fmt.Errorf("客户端 B 自检: %w", err)
 	}
 
 	const chunkSize = 32 << 10 // 32KB，小于 DERP MaxPacketSize(64KB)
 	payload := make([]byte, chunkSize)
 	if _, err := rand.Read(payload); err != nil {
-		return 0, 0, err
+		return 0, 0, bwDisconnected, err
 	}
 
 	bctx, cancel := context.WithTimeout(ctx, timeout)
@@ -457,11 +481,13 @@ func probeBandwidth(ctx context.Context, addr string, totalBytes int64, timeout 
 	// B 接收协程：收到 totalBytes 或出错/超时即退出
 	done := make(chan struct{})
 	var recvBytes int64
+	var recvErr error
 	go func() {
 		defer close(done)
 		for recvBytes < totalBytes {
 			m, e := recvWithTimeout(bctx, dcB, connB, timeout)
 			if e != nil {
+				recvErr = e
 				return
 			}
 			if rp, ok := m.(derp.ReceivedPacket); ok && rp.Source == keyA.Public() {
@@ -488,7 +514,17 @@ func probeBandwidth(ctx context.Context, addr string, totalBytes int64, timeout 
 		sent += int64(n)
 	}
 
-	<-done // 等 B 结束（收完或超时；超时由 recvWithTimeout 的 conn 关闭保证退出）
+	<-done // 等 B 结束（收完或出错/超时；超时由 recvWithTimeout 的 conn 关闭保证退出）
 	elapsed := time.Since(start)
-	return recvBytes, elapsed, nil
+
+	if recvBytes >= totalBytes {
+		return recvBytes, elapsed, bwComplete, nil
+	}
+	if bctx.Err() == context.DeadlineExceeded {
+		return recvBytes, elapsed, bwTimeout, nil
+	}
+	if recvErr != nil {
+		return recvBytes, elapsed, bwDisconnected, fmt.Errorf("接收中断: %w", recvErr)
+	}
+	return recvBytes, elapsed, bwDisconnected, fmt.Errorf("发送端提前停止")
 }

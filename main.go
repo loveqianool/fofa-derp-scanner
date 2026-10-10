@@ -575,9 +575,10 @@ func runCheck(path string, start int, maxLatency time.Duration, concurrency, sam
 type bwResult struct {
 	flatNode
 	mbps     float64
-	bytes    int64
+	bytes    int64 // 实际接收字节数
+	total    int64 // 目标字节数
 	elapsed  time.Duration
-	timedOut bool
+	status   bwStatus
 	err      error
 }
 
@@ -654,28 +655,24 @@ func runBandwidth(path string, totalBytes int64, concurrency int, timeout time.D
 			defer func() { <-sem }()
 
 			addr := net.JoinHostPort(jobs[i].host, strconv.Itoa(jobs[i].port))
-			n, elapsed, err := probeBandwidth(ctx, addr, totalBytes, timeout)
+			n, elapsed, status, err := probeBandwidth(ctx, addr, totalBytes, timeout)
 
 			mu.Lock()
-			r := bwResult{flatNode: all[i], bytes: n, elapsed: elapsed, err: err}
-			if err == nil {
-				if n < totalBytes {
-					r.timedOut = true
-				}
-				if elapsed > 0 {
-					r.mbps = float64(n) * 8 / elapsed.Seconds() / 1e6
-				}
+			r := bwResult{flatNode: all[i], bytes: n, total: totalBytes, elapsed: elapsed, status: status, err: err}
+			if err == nil && elapsed > 0 {
+				r.mbps = float64(n) * 8 / elapsed.Seconds() / 1e6
 			}
 			results[i] = r
 			done++
 			if err != nil {
 				fmt.Printf("[%d/%d] %-30s 失败: %v\n", done, len(jobs), jobs[i].label, shortErr(err))
+			} else if status == bwComplete {
+				fmt.Printf("[%d/%d] %-30s %.1f Mbps\n", done, len(jobs), jobs[i].label, r.mbps)
 			} else {
-				flag := ""
-				if r.timedOut {
-					flag = "（超时，按实际折算）"
-				}
-				fmt.Printf("[%d/%d] %-30s %.1f Mbps%s\n", done, len(jobs), jobs[i].label, r.mbps, flag)
+				// 没跑完：说明只收到一部分，带宽按实际接收量算
+				fmt.Printf("[%d/%d] %-30s %.1f Mbps（%s，只收到 %s/%s）\n",
+					done, len(jobs), jobs[i].label, r.mbps,
+					bwStatusText(status), formatSize(n), formatSize(totalBytes))
 			}
 			mu.Unlock()
 		}(i)
@@ -696,19 +693,19 @@ func runBandwidth(path string, totalBytes int64, concurrency int, timeout time.D
 	})
 
 	// 控制台表格
-	fmt.Printf("\n%-8s %-30s %10s %10s\n", "排名", "节点", "带宽", "耗时")
+	fmt.Printf("\n%-4s %-28s %8s %9s %s\n", "排名", "节点", "带宽", "耗时", "状态")
 	for i, r := range results {
 		if r.err != nil {
-			fmt.Printf("%-8d %-30s %10s %10s\n", i+1, r.node.HostName, "失败", "-")
+			fmt.Printf("%-4d %-28s %8s %9s %s\n", i+1, r.node.HostName, "失败", "-", shortErr(r.err))
 			continue
 		}
-		to := ""
-		if r.timedOut {
-			to = "*"
+		status := bwStatusText(r.status)
+		if r.status != bwComplete {
+			status += fmt.Sprintf("(%s/%s)", formatSize(r.bytes), formatSize(r.total))
 		}
-		fmt.Printf("%-8d %-30s %9.1f%s %9s\n", i+1, r.node.HostName, r.mbps, to, r.elapsed.Round(time.Millisecond))
+		fmt.Printf("%-4d %-28s %7.1fM %8s %s\n",
+			i+1, r.node.HostName, r.mbps, r.elapsed.Round(time.Millisecond), status)
 	}
-	fmt.Println("(* 超时，按实际接收量折算)")
 
 	// 写 bandwidth.json
 	type bwEntry struct {
@@ -718,10 +715,13 @@ func runBandwidth(path string, totalBytes int64, concurrency int, timeout time.D
 		Host      string  `json:"host"`
 		Port      int     `json:"port"`
 		Mbps      float64 `json:"mbps"`
-		Bytes     int64   `json:"bytes"`
-		ElapsedMs int64   `json:"elapsed_ms"`
-		TimedOut  bool    `json:"timed_out"`
-		Error     string  `json:"error,omitempty"`
+		// status: completed=跑完, timeout=超时未跑完, disconnected=连接中断
+		Status       string `json:"status"`
+		Received     string `json:"received"`
+		ReceivedBytes int64 `json:"received_bytes"`
+		TotalBytes   int64  `json:"total_bytes"`
+		ElapsedMs    int64  `json:"elapsed_ms"`
+		Error        string `json:"error,omitempty"`
 	}
 	type bwReport struct {
 		TestedAt string `json:"tested_at"`
@@ -740,15 +740,17 @@ func runBandwidth(path string, totalBytes int64, concurrency int, timeout time.D
 	rep.Config.Concurrency = concurrency
 	for _, r := range results {
 		e := bwEntry{
-			Name:      r.node.Name,
-			RegionID:  r.node.RegionID,
-			Region:    r.regionName,
-			Host:      r.node.HostName,
-			Port:      r.node.DERPPort,
-			Mbps:      math.Round(r.mbps*10) / 10,
-			Bytes:     r.bytes,
-			ElapsedMs: r.elapsed.Milliseconds(),
-			TimedOut:  r.timedOut,
+			Name:          r.node.Name,
+			RegionID:      r.node.RegionID,
+			Region:        r.regionName,
+			Host:          r.node.HostName,
+			Port:          r.node.DERPPort,
+			Mbps:          math.Round(r.mbps*10) / 10,
+			Status:        string(r.status),
+			Received:      formatSize(r.bytes) + "/" + formatSize(r.total),
+			ReceivedBytes: r.bytes,
+			TotalBytes:    r.total,
+			ElapsedMs:     r.elapsed.Milliseconds(),
 		}
 		if r.err != nil {
 			e.Error = shortErr(r.err)

@@ -323,9 +323,12 @@ func TestProbeBandwidth(t *testing.T) {
 	defer cancel()
 
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
-	n, elapsed, err := probeBandwidth(ctx, addr, 1<<20, 20*time.Second) // 1MB
+	n, elapsed, status, err := probeBandwidth(ctx, addr, 1<<20, 20*time.Second) // 1MB
 	if err != nil {
 		t.Fatalf("probeBandwidth 失败: %v", err)
+	}
+	if status != bwComplete {
+		t.Errorf("状态 = %q, want completed", status)
 	}
 	if n != 1<<20 {
 		t.Errorf("接收字节数 = %d, want %d", n, 1<<20)
