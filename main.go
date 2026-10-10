@@ -154,6 +154,11 @@ func probeAll(ctx context.Context, jobs []probeJob, concurrency, samples int, pi
 			select {
 			case sem <- struct{}{}:
 			case <-ctx.Done():
+				// 取消时记为失败，避免零值 rtt=0 被误判为可用
+				//（调用方虽有 ctx.Err() 兜底，这里多一层防御）
+				mu.Lock()
+				results[i] = probeResult{err: ctx.Err()}
+				mu.Unlock()
 				return
 			}
 			defer func() { <-sem }()
