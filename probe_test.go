@@ -245,7 +245,7 @@ func TestProbeRelay(t *testing.T) {
 	defer cancel()
 
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
-	if err := probeRelay(ctx, addr, true, 5*time.Second); err != nil {
+	if err := probeRelay(ctx, addr, 5*time.Second); err != nil {
 		t.Fatalf("中继转发验证失败: %v", err)
 	}
 }
@@ -259,7 +259,7 @@ func TestProbeRelayNoForward(t *testing.T) {
 
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
 	start := time.Now()
-	err := probeRelay(ctx, addr, true, 2*time.Second)
+	err := probeRelay(ctx, addr, 2*time.Second)
 	if err == nil {
 		t.Fatal("服务器不转发时期望失败，但通过了")
 	}
